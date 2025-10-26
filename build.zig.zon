@@ -1,0 +1,16 @@
+.{
+    .name = .ziggysm,
+    .version = "0.0.0",
+    .fingerprint = 0x1b5d0e61cb50fb6b, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.14.1",
+
+    .dependencies = .{
+        //
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
