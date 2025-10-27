@@ -46,10 +46,13 @@ pub fn init(
     };
 }
 
+$async write_byte(data: u8) error{Timeout}!void;
+$async read_byte() error{Timeout}!u8;
+
 $statemachine PS2(dri: *Generic_PS2_Device) (error{NoDevice} || IO_Error)!void
 {
     logger.debug("reset device...", .{});
-    $call dri.write_command(.reset, .from_ms(1000)) -> reset_result;
+    $call write_command(.reset, .from_ms(1000)) -> reset_result;
     reset_result catch |err| switch (err) {
         error.Timeout => return error.NoDevice,
         error.NoAcknowledge, error.DeviceError => |e| return e,
@@ -69,20 +72,20 @@ $statemachine PS2(dri: *Generic_PS2_Device) (error{NoDevice} || IO_Error)!void
 
     logger.info("detected PS/2 device of type {}", .{device_type});
 
-    if (device_type.isMouse()) {
+    $if (device_type.isMouse()) {
         $jump handle_mouse();
-    } else if (device_type.isKeyboard()) {
-        $jump handle_keyboard();
-    } else {
-        logger.err("unsupported device type: {}", .{device_type});
     }
+    $if (device_type.isKeyboard()) {
+        $jump handle_keyboard();
+    }
+    logger.err("unsupported device type: {}", .{device_type});
 }
 
 $submachine handle_mouse(dri: *Generic_PS2_Device) IO_Error!void {
     $state init_deadline: Deadline = .from_ms(2500);
 
-    $yield $try write_command(.set_defaults, ${init_deadline});
-    $yield $try write_command(.enable_scanning, ${init_deadline});
+    $call $try write_command(.set_defaults, ${init_deadline});
+    $call $try write_command(.enable_scanning, ${init_deadline});
 
     // TODO: Here, we should switch over to interrupt driven mode on x86!
 
@@ -108,13 +111,15 @@ $submachine handle_mouse(dri: *Generic_PS2_Device) IO_Error!void {
 $submachine handle_keyboard(dri: *Generic_PS2_Device) IO_Error!void {
     $state init_deadline: Deadline = .from_ms(3000);
 
-    try dri.write_command(.set_defaults, ${init_deadline});
+    $yield $try write_command(.set_defaults, ${init_deadline});
 
-    try dri.write_command(Keyboard.select_scancode_set, ${init_deadline});
-    try dri.write_byte(0x01, ${init_deadline}); // select scancode set 1
+    $yield $try write_command(Keyboard.select_scancode_set, ${init_deadline});
 
-    try dri.write_command(Keyboard.select_scancode_set, ${init_deadline});
-    try dri.write_byte(0x00, ${init_deadline}); // get scancode set
+    $yield $try write_byte(0x01, ${init_deadline}); // select scancode set 1
+
+    $call $try write_command(Keyboard.select_scancode_set, ${init_deadline});
+
+    $yield $try write_byte(0x00, ${init_deadline}); // get scancode set
     
     $state scancode_ack: u8 = 0;
     $yield $try read_byte(${init_deadline}) -> ${scancode_ack};
@@ -171,7 +176,7 @@ $submachine handle_keyboard(dri: *Generic_PS2_Device) IO_Error!void {
 }
 
 $proc drain(timeout: Deadline) void {
-    while (true) {
+    $while (true) {
         $yield read_byte(timeout) -> read_result;
         while (read_result) |byte| {
             logger.debug("draining 0x{X:0>2}", .{byte});
@@ -197,7 +202,8 @@ $proc detect_device_type(timeout: Deadline) !?ps2.DeviceType {
 }
 
 $proc write_command(cmd: Command, timeout: Deadline) IO_Error!void {
-    for (0..3) |_| {
+    $state count: usize = 0;
+    $while(${count} < 3) {
         logger.debug("write {}", .{cmd});
         $yield $try write_byte(@intFromEnum(cmd), timeout);
 
@@ -208,11 +214,11 @@ $proc write_command(cmd: Command, timeout: Deadline) IO_Error!void {
 
         switch (response) {
             .ack => $return,
-            .resend => {
-                continue;
-            },
+            .resend => {},
             else => $return error.NoAcknowledge,
         }
+
+        ${count} += 1;
     }
 
     // This is actually a device error as we didn't receive either ACK or RESEND, but we also didn't timeout
