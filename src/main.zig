@@ -17,6 +17,8 @@ pub fn main() !void {
 
     var document = try parse(allocator, script);
     defer document.deinit();
+
+    try ast.dump(document, std.io.getStdOut().writer());
 }
 
 pub fn Token(comptime E: type) type {
@@ -75,6 +77,8 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) !ast.Document {
     defer list.deinit();
 
     while (try parser.accept_top_level_node()) |tln| {
+        if (tln == .raw_code and tln.raw_code.text.len == 0)
+            continue;
         try list.append(tln);
     }
 
@@ -176,6 +180,9 @@ pub const Parser = struct {
             }
 
             const stmt = try parser.accept_statement();
+            if (stmt == .raw_code and stmt.raw_code.text.len == 0) {
+                continue;
+            }
             try statements.append(stmt);
         }
 
@@ -299,7 +306,7 @@ pub const Parser = struct {
         const name = tok.next_word() orelse return error.SyntaxError;
         const argv = try parser.next_parens_list();
 
-        const result_target = if (parser.try_accept_literal("->")) blk: {
+        const result_target: ?ast.TextBlock = if (parser.try_accept_literal("->")) blk: {
             const code = tok.lex_raw_code(.{
                 .stop_chars = ";",
                 .include_stop_char = false,
@@ -309,7 +316,7 @@ pub const Parser = struct {
             });
             if (code.len == 0)
                 return error.SyntaxError;
-            break :blk code;
+            break :blk .{ .text = code };
         } else null;
 
         try parser.accept_literal(";");
@@ -404,6 +411,8 @@ const Tokenizer = struct {
         return std.mem.startsWith(u8, tok.data[tok.pos..], text);
     }
 
+    pub const whitespace = " \t\r\n";
+
     fn is_space(chr: u8) bool {
         return switch (chr) {
             ' ', '\t', '\r', '\n' => true,
@@ -492,6 +501,10 @@ const Tokenizer = struct {
         };
     }
 
+    fn strip_ws(text: []const u8) []const u8 {
+        return std.mem.trim(u8, text, Tokenizer.whitespace);
+    }
+
     fn lex_raw_code(tokenizer: *Tokenizer, options: struct {
         nest_braces: bool,
         nest_parens: bool,
@@ -510,7 +523,7 @@ const Tokenizer = struct {
         var nesting: usize = 0;
         while (true) {
             if (tokenizer.pos >= data.len) {
-                return data[start..tokenizer.pos];
+                return strip_ws(data[start..tokenizer.pos]);
             }
             const char = data[tokenizer.pos];
             tokenizer.pos += 1;
@@ -525,7 +538,7 @@ const Tokenizer = struct {
                     if (!options.include_stop_char) {
                         tokenizer.pos -= 1;
                     }
-                    return data[start..tokenizer.pos];
+                    return strip_ws(data[start..tokenizer.pos]);
                 }
 
                 select: switch (char) {
@@ -556,7 +569,7 @@ const Tokenizer = struct {
                     // end of "non-code", but only on non-nested setups and not on "${"
                     '$' => if (nesting == 0 and (tokenizer.pos >= data.len or data[tokenizer.pos] != '{')) {
                         tokenizer.pos -= 1;
-                        return data[start..tokenizer.pos];
+                        return strip_ws(data[start..tokenizer.pos]);
                     },
 
                     '[' => nesting += 1,
@@ -567,7 +580,7 @@ const Tokenizer = struct {
                     else => {},
                 }
                 if (options.only_nesting_group and nesting == 0) {
-                    return data[start..tokenizer.pos];
+                    return strip_ws(data[start..tokenizer.pos]);
                 }
             }
         }
@@ -656,7 +669,7 @@ pub const ast = struct {
 
     pub const CallLike = struct {
         with_try: bool,
-        output_to: ?[]const u8,
+        output_to: ?TextBlock,
         function_name: []const u8,
         parameters: []const TextBlock,
     };
@@ -702,4 +715,96 @@ pub const ast = struct {
             try writer.writeAll("')");
         }
     };
+
+    pub fn dump(doc: Document, writer: anytype) !void {
+        const Dumper = struct {
+            const Dumper = @This();
+
+            stream: @TypeOf(writer),
+
+            fn render(dmp: Dumper, d: Document) !void {
+                for (d.top_level_nodes) |node| {
+                    switch (node) {
+                        .raw_code => |code| try dmp.stream.print("{}\n", .{code}),
+
+                        .async_func => |func| {
+                            try dmp.stream.print("async {s}({any}) {}\n", .{
+                                func.name,
+                                func.arguments,
+                                func.return_type,
+                            });
+                        },
+
+                        .process, .state_machine, .sub_machine => |sm| {
+                            try dmp.stream.print("{s} {s}({any}) {}\n", .{ @tagName(node), sm.name, sm.arguments, sm.return_type });
+                            try dmp.block(sm.body, 0);
+                        },
+                    }
+                }
+            }
+
+            fn block(dmp: Dumper, blk: Block, depth: usize) @TypeOf(writer).Error!void {
+                const prefix = ("\t" ** 32)[0..depth];
+
+                try dmp.stream.print("{s}{{\n", .{prefix});
+                for (blk.statements) |stmt| {
+                    try dmp.statement(stmt, depth + 1);
+                }
+                try dmp.stream.print("{s}}}\n", .{prefix});
+            }
+            fn statement(dmp: Dumper, stmt: Statement, depth: usize) !void {
+                const prefix = ("\t" ** 32)[0..depth];
+
+                try dmp.stream.writeAll(prefix);
+                switch (stmt) {
+                    .raw_code => |code| try dmp.stream.print("{}\n", .{code}),
+                    .state_variable => |state| {
+                        try dmp.stream.print("$state {s}: {} = {};\n", .{
+                            state.variable_name,
+                            state.type_spec,
+                            state.initial_value,
+                        });
+                    },
+                    .yield, .call, .jump => |call| {
+                        try dmp.stream.print("{s}{s} {s}({any})", .{
+                            @tagName(stmt),
+                            if (call.with_try) " $try" else "",
+                            call.function_name,
+                            call.parameters,
+                        });
+                        if (call.output_to) |output| {
+                            try dmp.stream.print("-> {}", .{output});
+                        }
+                        try dmp.stream.writeAll(";\n");
+                    },
+                    .@"return" => |ret| {
+                        try dmp.stream.writeAll("$return");
+                        if (ret.value) |value| {
+                            try dmp.stream.print(" {}", .{value});
+                        }
+
+                        try dmp.stream.writeAll(";\n");
+                    },
+                    .while_loop => |cond| {
+                        try dmp.stream.writeAll("$while_loop(");
+                        try dmp.stream.print("{}", .{cond.condition});
+                        try dmp.stream.writeAll(")\n");
+                        try dmp.block(cond.body, depth);
+                    },
+                    .if_condition => |cond| {
+                        try dmp.stream.writeAll("$if_condition(");
+                        try dmp.stream.print("{}", .{cond.condition});
+                        try dmp.stream.writeAll(")\n");
+                        try dmp.block(cond.true_body, depth);
+                    },
+                    .@"break" => try dmp.stream.writeAll("$break;\n"),
+                    .@"continue" => try dmp.stream.writeAll("$continue;\n"),
+                }
+            }
+        };
+
+        var dumper: Dumper = .{ .stream = writer };
+
+        try dumper.render(doc);
+    }
 };
