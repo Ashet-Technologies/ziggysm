@@ -7,10 +7,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const args_dep = b.dependency("args", .{});
+    const args_mod = args_dep.module("args");
+
     const ziggysm_mod = b.addModule("ziggysm", .{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "args", .module = args_mod },
+        },
     });
 
     const exe = b.addExecutable(.{

@@ -1,0 +1,31 @@
+const std = @import("std");
+
+$async write_byte(data: u8) void;
+$async read_byte() u8;
+
+$statemachine Basic() void {
+    $while(true) {
+        $yield read_byte() -> $state output;
+
+        $if(${output} == 0) {
+            $return;
+        }
+
+        $yield write_byte(${output});
+    }
+}
+          
+test SM {
+    {
+        var sm: SM = .{};
+        try std.testing.expect(.read_byte == try sm.step(.launch));
+        try std.testing.expect(.stop == try sm.step(.{ .read_byte = 0 }));
+    }
+    {
+        var sm: SM = .{};
+        try std.testing.expect(.read_byte == try sm.step(.launch));
+        try std.testing.expect(.write_byte == try sm.step(.{ .read_byte = 10 }));
+        try std.testing.expect(.read_byte == try sm.step(.write_byte));
+        try std.testing.expect(.stop == try sm.step(.{ .read_byte = 0 }));
+    }
+}

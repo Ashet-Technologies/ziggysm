@@ -1,24 +1,86 @@
 const std = @import("std");
+const args_parser = @import("args");
 
-pub fn main() !void {
+const CliArgs = struct {
+    help: bool = false,
+    output: []const u8 = "",
+
+    pub const shorthands = .{
+        .h = "help",
+        .o = "output",
+    };
+};
+
+pub fn main() !u8 {
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
 
     const allocator = arena.allocator();
 
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+    var cli = args_parser.parseForCurrentProcess(CliArgs, allocator, .print) catch return 1;
+    defer cli.deinit();
 
-    if (argv.len != 2)
+    if (cli.positionals.len != 1) {
         @panic("poop");
+    }
 
-    const script = try std.fs.cwd().readFileAlloc(allocator, argv[1], 1 << 20);
+    const file_name = cli.positionals[0];
+
+    const script = try std.fs.cwd().readFileAlloc(allocator, file_name, 1 << 20);
     defer allocator.free(script);
 
     var document = try parse(allocator, script);
     defer document.deinit();
 
     try ast.dump(document, std.io.getStdOut().writer());
+
+    var program = try generate_code(allocator, document);
+    defer program.deinit();
+    {
+        const writer = std.io.getStdOut().writer();
+        for (program.structure) |node| {
+            switch (node) {
+                .state_machine => |sm| {
+                    try writer.print("StateMachine {s}:\n", .{sm.name});
+                    try ir.dump(sm, writer);
+                },
+                .top_level_code => |code| try writer.print("TopLevel Code: {}\n", .{code}),
+            }
+        }
+    }
+
+    const unformatted_code = blk: {
+        var sink: std.ArrayList(u8) = .init(allocator);
+        defer sink.deinit();
+
+        for (program.structure) |node| {
+            switch (node) {
+                .state_machine => |sm| try render(allocator, sm, sink.writer()),
+                .top_level_code => |code| try sink.appendSlice(code.text), // no processing of global replacements
+            }
+        }
+
+        break :blk try sink.toOwnedSliceSentinel(0);
+    };
+
+    const formatted_code = blk: {
+        const zig_ast = try std.zig.Ast.parse(allocator, unformatted_code, .zig);
+        if (zig_ast.errors.len > 0)
+            break :blk unformatted_code;
+
+        break :blk try zig_ast.render(allocator);
+    };
+
+    if (cli.options.output.len > 0) {
+        try std.fs.cwd().writeFile(.{
+            .sub_path = cli.options.output,
+            .data = formatted_code,
+        });
+    } else {
+        try std.io.getStdOut().writeAll(formatted_code);
+    }
+
+    return 0;
 }
 
 pub fn Token(comptime E: type) type {
@@ -306,7 +368,10 @@ pub const Parser = struct {
         const name = tok.next_word() orelse return error.SyntaxError;
         const argv = try parser.next_parens_list();
 
+        var as_state: bool = false;
         const result_target: ?ast.TextBlock = if (parser.try_accept_literal("->")) blk: {
+            as_state = parser.try_accept_literal("$state");
+
             const code = tok.lex_raw_code(.{
                 .stop_chars = ";",
                 .include_stop_char = false,
@@ -326,6 +391,7 @@ pub const Parser = struct {
             .parameters = argv,
             .output_to = result_target,
             .with_try = with_try,
+            .as_state = as_state,
         };
     }
 
@@ -669,6 +735,7 @@ pub const ast = struct {
 
     pub const CallLike = struct {
         with_try: bool,
+        as_state: bool,
         output_to: ?TextBlock,
         function_name: []const u8,
         parameters: []const TextBlock,
@@ -773,7 +840,10 @@ pub const ast = struct {
                             call.parameters,
                         });
                         if (call.output_to) |output| {
-                            try dmp.stream.print("-> {}", .{output});
+                            try dmp.stream.print("-> {s}{}", .{
+                                if (call.with_try) " $state" else "",
+                                output,
+                            });
                         }
                         try dmp.stream.writeAll(";\n");
                     },
@@ -808,3 +878,740 @@ pub const ast = struct {
         try dumper.render(doc);
     }
 };
+
+const ir = struct {
+    pub const TextBlock = ast.TextBlock;
+
+    pub const Label = enum(usize) {
+        _,
+
+        pub fn format(lbl: Label, fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            _ = fmt;
+            _ = options;
+
+            try writer.print("lbl{}", .{@intFromEnum(lbl)});
+        }
+    };
+
+    pub const Program = struct {
+        arena: std.heap.ArenaAllocator,
+
+        structure: []Node,
+
+        pub fn deinit(pgm: *Program) void {
+            pgm.arena.deinit();
+            pgm.* = undefined;
+        }
+    };
+
+    pub const Node = union(enum) {
+        state_machine: StateMachine,
+        top_level_code: TextBlock,
+    };
+
+    pub const StateMachine = struct {
+        name: []const u8,
+
+        labels: std.AutoArrayHashMap(Label, LabelData), // id => label info
+        // states: std.StringArrayHashMap(TextBlock), // name => type
+        instructions: []Instruction,
+    };
+
+    pub const LabelData = struct {
+        tag: ?[]const u8,
+        offset: ?usize,
+    };
+
+    pub const SuspendState = struct {
+        parameters: []const TextBlock,
+        result: ?TextBlock,
+    };
+
+    pub const Instruction = union(enum) {
+        stop,
+        execute: TextBlock,
+
+        branch: Branch,
+        true_branch: ConditionalBranch,
+        false_branch: ConditionalBranch,
+        dyn_branch: DynamicBranch,
+
+        call: CallDynamicTarget,
+
+        yield: Yield,
+
+        set_state: SetState,
+    };
+
+    pub const Yield = struct {
+        function: []const u8,
+        arguments: []const TextBlock,
+        output: ?TextBlock,
+        use_try: bool,
+    };
+    pub const Branch = struct {
+        target: Label,
+    };
+
+    pub const DynamicBranch = struct {
+        target: []const u8,
+    };
+
+    pub const CallDynamicTarget = struct {
+        target: []const u8,
+    };
+
+    pub const ConditionalBranch = struct {
+        target: Label,
+        condition: TextBlock,
+    };
+
+    pub const SetState = struct {
+        variable: []const u8,
+        value: TextBlock,
+    };
+
+    pub fn dump(pgm: StateMachine, writer: anytype) !void {
+        for (pgm.instructions, 0..) |instr, offset| {
+            for (pgm.labels.keys(), pgm.labels.values()) |lbl, data| {
+                if (data.offset != offset)
+                    continue;
+                try writer.print("        {}:\n", .{
+                    lbl,
+                });
+            }
+            try writer.print("0x{X:0>4}    ", .{
+                offset,
+            });
+            switch (instr) {
+                .stop => try writer.writeAll("STOP"),
+                .execute => |code| {
+                    try writer.print("EXEC  {}", .{code});
+                },
+                .yield => |yield| {
+                    try writer.print("YIELD {s}, {any}, {s}{?}", .{
+                        yield.function,
+                        yield.arguments,
+                        if (yield.use_try) "try " else "",
+                        yield.output,
+                    });
+                },
+                .set_state => |state| {
+                    try writer.print("SETST {s}, {}", .{ state.variable, state.value });
+                },
+                .branch => |branch| {
+                    try writer.print("BR    {}", .{branch.target});
+                },
+                .dyn_branch => |branch| {
+                    try writer.print("BR.D  {s}", .{branch.target});
+                },
+                .call => |branch| {
+                    try writer.print("CALL  {s}", .{branch.target});
+                },
+                .true_branch => |branch| {
+                    try writer.print("BR.T  {}, {}", .{ branch.target, branch.condition });
+                },
+                .false_branch => |branch| {
+                    try writer.print("BR.F  {}, {}", .{ branch.target, branch.condition });
+                },
+            }
+            try writer.writeAll("\n");
+        }
+    }
+};
+
+fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Program {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer arena.deinit();
+
+    var structure: std.ArrayList(ir.Node) = .init(arena.allocator());
+
+    // TODO: Create an index for all process, asyncs and submachines:
+    for (document.top_level_nodes) |node| {
+        switch (node) {
+            .state_machine, .raw_code => continue,
+
+            .async_func => {},
+            .process => {},
+            .sub_machine => {},
+        }
+    }
+
+    for (document.top_level_nodes) |node| {
+        const sm = switch (node) {
+            .state_machine => |*sm| sm,
+            .raw_code => |code| {
+                try structure.append(.{ .top_level_code = code });
+                continue;
+            },
+
+            .async_func, .process, .sub_machine => continue,
+        };
+
+        var cg: CodeGen = .{
+            .allocator = arena.allocator(),
+            .instructions = .init(arena.allocator()),
+            .labels = .init(arena.allocator()),
+            .tagged_labels = .init(arena.allocator()),
+        };
+
+        _ = try cg.generate(sm.*, true);
+
+        // TODO: Generate all dependencies as well here:
+
+        const instructions = try cg.instructions.toOwnedSlice();
+        errdefer cg.allocator.free(instructions);
+
+        var labels: std.AutoArrayHashMap(ir.Label, ir.LabelData) = .init(arena.allocator());
+        errdefer labels.deinit();
+
+        for (cg.labels.items) |label| {
+            try labels.put(label.id, .{
+                .offset = label.offset,
+                .tag = null,
+            });
+        }
+
+        try structure.append(.{ .state_machine = .{
+            .name = sm.name,
+            .instructions = instructions,
+            .labels = labels,
+        } });
+    }
+
+    return .{
+        .arena = arena,
+        .structure = try structure.toOwnedSlice(),
+    };
+}
+
+const CodeGen = struct {
+    const Label = struct {
+        offset: ?usize = null,
+        used: bool = false,
+        id: ir.Label,
+    };
+
+    allocator: std.mem.Allocator,
+    instructions: std.ArrayList(ir.Instruction),
+
+    labels: std.ArrayList(*Label),
+    tagged_labels: std.StringArrayHashMap(?*Label),
+
+    fn create_label(cg: *CodeGen, mode: enum { here, undefined }) !*Label {
+        const lbl = try cg.allocator.create(Label);
+        errdefer cg.allocator.destroy(lbl);
+
+        lbl.* = .{
+            .id = @enumFromInt(cg.labels.items.len),
+            .offset = switch (mode) {
+                .here => cg.instructions.items.len,
+                .undefined => null,
+            },
+        };
+        try cg.labels.append(lbl);
+
+        return lbl;
+    }
+
+    fn define_label(cg: *CodeGen, lbl: *Label) !void {
+        if (lbl.offset != null)
+            @panic("label was defined twice!");
+        lbl.offset = cg.instructions.items.len;
+    }
+
+    fn tag_label(cg: *CodeGen, lbl: *Label, tag: []const u8) !void {
+        const gop = try cg.tagged_labels.getOrPut(tag);
+        if (gop.found_existing) {
+            if (gop.value_ptr.* != null)
+                return error.DuplicateLabelTag;
+        }
+        gop.value_ptr.* = lbl;
+    }
+
+    fn get_tagged_label(cg: *CodeGen, tag: []const u8) !*Label {
+        const gop = try cg.tagged_labels.getOrPut(tag);
+        if (gop.found_existing) {
+            return gop.value_ptr.*.?;
+        }
+        errdefer _ = cg.tagged_labels.swapRemove(tag);
+        gop.value_ptr.* = try cg.create_label(.undefined);
+        return gop.value_ptr.*.?;
+    }
+
+    fn generate(cg: *CodeGen, sm: ast.StateMachine, is_toplevel: bool) !ir.Label {
+        const sm_label = try cg.create_label(.here);
+
+        try cg.tag_label(sm_label, sm.name);
+
+        try cg.generate_block(sm.body, .{
+            .scope = sm.name,
+            .is_toplevel = is_toplevel,
+        });
+
+        try cg.emit(.stop);
+
+        return sm_label.id;
+    }
+
+    const BlockContext = struct {
+        const Loop = struct {
+            break_point: *Label,
+            cont_point: *Label,
+        };
+
+        scope: []const u8,
+        loop: ?Loop = null,
+        is_toplevel: bool,
+    };
+
+    fn generate_block(cg: *CodeGen, block: ast.Block, ctx: BlockContext) error{ OutOfMemory, SyntaxError, BreakOutsideLoop, ValueReturnOnToplevel }!void {
+        for (block.statements) |stmt| {
+            try cg.generate_stmt(stmt, ctx);
+        }
+    }
+
+    fn generate_stmt(cg: *CodeGen, stmt: ast.Statement, ctx: BlockContext) !void {
+        switch (stmt) {
+            .raw_code => |code| try cg.emit(.{ .execute = code }),
+
+            .state_variable => |state| {
+                try cg.emit(.{ .set_state = .{
+                    .variable = state.variable_name,
+                    .value = state.initial_value,
+                } });
+            },
+
+            .yield => |yield| {
+                try cg.emit(.{ .yield = .{
+                    .function = yield.function_name,
+                    .arguments = yield.parameters,
+                    .output = if (yield.output_to) |output_to|
+                        if (yield.as_state)
+                            .{ .text = try std.fmt.allocPrint(cg.allocator, "${{{s}}}", .{output_to.text}) }
+                        else
+                            output_to
+                    else
+                        null,
+                    .use_try = yield.with_try,
+                } });
+            },
+
+            .call => |call| {
+                for (call.parameters) |param| {
+                    // TODO: Emit call
+                    _ = param;
+                }
+
+                try cg.emit(.{ .call = .{
+                    .target = call.function_name,
+                } });
+            },
+
+            .@"return" => |ret| {
+                if (ctx.is_toplevel) {
+                    if (ret.value != null) {
+                        return error.ValueReturnOnToplevel;
+                    }
+                    try cg.emit(.stop);
+                } else {
+                    if (ret.value) |value| {
+                        try cg.emit(.{ .set_state = .{
+                            .variable = try cg.get_return_value(ctx.scope),
+                            .value = value,
+                        } });
+                    }
+                    try cg.emit(.{ .dyn_branch = .{
+                        .target = ctx.scope,
+                    } });
+                }
+            },
+
+            .jump => |jmp| {
+
+                // TODO: Emit state changes here
+
+                if (jmp.with_try)
+                    return error.SyntaxError;
+                const target = try cg.get_tagged_label(jmp.function_name);
+                target.used = true;
+                try cg.emit(.{
+                    .branch = .{ .target = target.id },
+                });
+            },
+
+            .while_loop => |loop| {
+                const loop_start = try cg.create_label(.here);
+                const loop_end = try cg.create_label(.undefined);
+                loop_start.used = true;
+                loop_end.used = true;
+
+                try cg.emit(.{
+                    .false_branch = .{
+                        .target = loop_end.id,
+                        .condition = loop.condition,
+                    },
+                });
+                try cg.generate_block(loop.body, .{
+                    .scope = ctx.scope,
+                    .is_toplevel = ctx.is_toplevel,
+                    .loop = .{
+                        .cont_point = loop_start,
+                        .break_point = loop_end,
+                    },
+                });
+                try cg.emit(.{
+                    .branch = .{ .target = loop_start.id },
+                });
+
+                try cg.define_label(loop_end);
+            },
+            .if_condition => |cond| {
+                const cond_skip = try cg.create_label(.undefined);
+                cond_skip.used = true;
+
+                try cg.emit(.{
+                    .false_branch = .{
+                        .target = cond_skip.id,
+                        .condition = cond.condition,
+                    },
+                });
+
+                try cg.generate_block(cond.true_body, ctx);
+
+                try cg.define_label(cond_skip);
+            },
+
+            .@"break" => {
+                const loop = ctx.loop orelse return error.BreakOutsideLoop;
+                loop.break_point.used = true;
+                try cg.emit(.{
+                    .branch = .{ .target = loop.break_point.id },
+                });
+            },
+            .@"continue" => {
+                const loop = ctx.loop orelse return error.BreakOutsideLoop;
+                loop.cont_point.used = true;
+                try cg.emit(.{
+                    .branch = .{ .target = loop.cont_point.id },
+                });
+            },
+        }
+    }
+
+    fn get_return_value(cg: *CodeGen, scope: []const u8) ![]const u8 {
+        return try std.fmt.allocPrint(cg.allocator, "{s}:retval", .{
+            scope,
+        });
+    }
+
+    fn emit(cg: *CodeGen, instr: ir.Instruction) !void {
+        try cg.instructions.append(instr);
+    }
+};
+
+fn render(allocator: std.mem.Allocator, pgm: ir.StateMachine, stream: anytype) !void {
+    const fmt_id = std.zig.fmtId;
+
+    const Renderer = struct {
+        const Renderer = @This();
+
+        const Writer = @TypeOf(stream);
+
+        const State = enum(u64) {
+            initial = 0,
+
+            stopped = std.math.maxInt(u64),
+            _,
+
+            pub fn format(state: State, fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+                _ = fmt;
+                _ = options;
+                switch (state) {
+                    .initial => try writer.writeAll("initial"),
+                    .stopped => try writer.writeAll("stopped"),
+                    _ => try writer.print("state{}", .{@intFromEnum(state)}),
+                }
+            }
+        };
+
+        writer: Writer,
+        states: usize = 0,
+        pgm: ir.StateMachine,
+
+        offset_to_state: std.AutoArrayHashMap(usize, State),
+        label_to_state: std.AutoArrayHashMap(ir.Label, State),
+
+        current_state: ?State = null,
+        needs_stop_state: bool = false,
+
+        required_states: std.StringArrayHashMap(void),
+        required_asyncs: std.StringArrayHashMap(void),
+
+        fn alloc_state(ren: *Renderer) !State {
+            ren.states += 1;
+            return @enumFromInt(ren.states);
+        }
+
+        fn state_from_offset(ren: *Renderer, offset: usize) ?State {
+            return ren.offset_to_state.get(offset);
+        }
+
+        fn state_from_label(ren: *Renderer, lbl: ir.Label) State {
+            return ren.label_to_state.get(lbl).?;
+        }
+
+        fn run(ren: *Renderer) !void {
+            try ren.writeAll("\n\n");
+            try ren.writeAll("pub const SM = struct {\n");
+
+            try ren.writeAll("  state: State = .initial,\n");
+            try ren.writeAll("  branches: BranchSet = .{},\n");
+            try ren.writeAll("  data: Data = .{},\n");
+
+            try ren.writeAll("  pub fn step(sm: *SM, resume_val: ReturnValue) !Result {\n");
+
+            try ren.writeAll("    __sm__: switch(sm.state) {\n");
+
+            try ren.offset_to_state.putNoClobber(0, .initial);
+
+            for (ren.pgm.labels.values()) |value| {
+                const offset = value.offset.?;
+
+                const gop = try ren.offset_to_state.getOrPut(offset);
+                if (gop.found_existing)
+                    continue;
+                gop.value_ptr.* = try ren.alloc_state();
+            }
+
+            for (ren.pgm.labels.keys(), ren.pgm.labels.values()) |key, value| {
+                try ren.label_to_state.putNoClobber(key, ren.offset_to_state.get(value.offset.?).?);
+            }
+
+            var last_result: RenderResult = .default;
+            for (ren.pgm.instructions, 0..) |instr, offset| {
+                if (ren.offset_to_state.get(offset)) |state| {
+                    try ren.write_new_state(state, (last_result != .switches_state));
+                }
+
+                last_result = try ren.render_instr(instr);
+            }
+
+            if (ren.needs_stop_state) {
+                try ren.write_new_state(.stopped, (last_result != .switches_state));
+                try ren.writeAll("        @panic(\"The state machine has stopped and can no longer be resumed!\");\n");
+            }
+
+            if (ren.current_state != null) {
+                try ren.writeAll("      },\n");
+            }
+            try ren.writeAll("    }\n");
+
+            try ren.writeAll("  }\n\n");
+
+            try ren.writeAll("  const State = enum {\n");
+            for (0..ren.states + 1) |state_id| {
+                const state: State = @enumFromInt(state_id);
+                try ren.print("    {},\n", .{state});
+            }
+            if (ren.needs_stop_state) {
+                try ren.writeAll("    stopped,\n");
+            }
+            try ren.writeAll("  };\n\n");
+            try ren.writeAll("  const BranchSet = struct {};\n\n");
+            try ren.writeAll("  const Data = struct {\n");
+
+            for (ren.required_states.keys()) |state_name| {
+                try ren.print("{}: u8 = undefined,\n", .{
+                    fmt_id(state_name),
+                });
+            }
+
+            try ren.writeAll("  };\n\n");
+            try ren.writeAll("  const ReturnValue = union(enum) {\n");
+            try ren.writeAll("      launch,\n\n");
+            for (ren.required_asyncs.keys()) |async_func| {
+                try ren.print("      {},", .{
+                    fmt_id(async_func),
+                });
+            }
+            try ren.writeAll("  };\n\n");
+            try ren.writeAll("  const Result = union(enum) {\n");
+            try ren.writeAll("      stop,\n\n");
+            for (ren.required_asyncs.keys()) |async_func| {
+                try ren.print("      {}: struct{{}},", .{
+                    fmt_id(async_func),
+                });
+            }
+
+            try ren.writeAll("  };\n\n");
+
+            try ren.writeAll("\n};\n\n");
+        }
+
+        const RenderResult = enum {
+            default,
+            switches_state,
+        };
+        fn render_instr(ren: *Renderer, instr: ir.Instruction) !RenderResult {
+            try ren.print("      // <{s}>\n", .{@tagName(instr)});
+            const output = try ren.render_instr_inner(instr);
+            try ren.print("      // </{s}>\n\n", .{@tagName(instr)});
+            return output;
+        }
+
+        fn render_instr_inner(ren: *Renderer, instr: ir.Instruction) !RenderResult {
+            switch (instr) {
+                .stop => {
+                    ren.needs_stop_state = true;
+                    try ren.writeAll("      sm.state = .stopped;\n");
+                    try ren.writeAll("      return .stop;\n");
+                    return .switches_state;
+                },
+                .execute => |code| {
+                    try ren.print("      {s}\n", .{ren.fmt_code(code)});
+                    return .default;
+                },
+                .branch => |branch| {
+                    try ren.write_state_switch(ren.state_from_label(branch.target));
+                    return .switches_state;
+                },
+                .true_branch, .false_branch => |branch| {
+                    try ren.print("      if(({s}) == {}) {{\n", .{
+                        ren.fmt_code(branch.condition),
+                        (instr == .true_branch),
+                    });
+                    try ren.write_state_switch(ren.state_from_label(branch.target));
+                    try ren.writeAll("      }\n");
+                    return .default;
+                },
+
+                .dyn_branch => |branch| {
+                    try ren.print("// TODO: dyn_branch({s})\n", .{branch.target});
+                    return .switches_state;
+                },
+
+                .call => |branch| {
+                    try ren.print("// TODO: call({s})\n", .{branch.target});
+                    return .switches_state;
+                },
+
+                .yield => |yield| {
+                    try ren.required_asyncs.put(yield.function, {});
+
+                    const hopstate = try ren.alloc_state();
+
+                    try ren.print("      sm.state = .{s};\n", .{hopstate});
+                    try ren.print("      return .{{ .{} = .{{ ", .{
+                        fmt_id(yield.function),
+                    });
+                    for (yield.arguments, 0..) |arg, i| {
+                        if (i > 0) {
+                            try ren.writeAll(", ");
+                        }
+                        try ren.print("({s})", .{ren.fmt_code(arg)});
+                    }
+                    try ren.writeAll(" } };\n");
+                    try ren.write_new_state(hopstate, false);
+                    try ren.print("    if(resume_val != .{[0]})\n      @panic(\"BUG: State machine must be resumed with .{[0]}\");\n", .{
+                        fmt_id(yield.function),
+                    });
+
+                    if (yield.output) |output_target| {
+                        try ren.print("{s} = ", .{ren.fmt_code(output_target)});
+                        if (yield.use_try) {
+                            try ren.writeAll("try ");
+                        }
+                        try ren.print("resume_val.{};\n", .{fmt_id(yield.function)});
+                    } else {
+                        std.debug.assert(yield.use_try == false);
+                    }
+
+                    return .default;
+                },
+
+                .set_state => |state| {
+                    try ren.print("// TODO: set_state({s}, {s})\n", .{
+                        state.variable,
+                        ren.fmt_code(state.value),
+                    });
+                    return .default;
+                },
+            }
+        }
+
+        fn write_state_switch(ren: *Renderer, state: State) !void {
+            try ren.print("      sm.state = .{};\n", .{state});
+            try ren.print("      continue :__sm__ .{};\n", .{state});
+        }
+
+        fn write_new_state(ren: *Renderer, new_state: State, include_autobranch: bool) !void {
+            if (ren.current_state != null) {
+                if (include_autobranch) {
+                    try ren.write_state_switch(new_state);
+                }
+                try ren.writeAll("    },\n");
+            }
+            try ren.print("    .{} => {{\n", .{new_state});
+            ren.current_state = new_state;
+        }
+
+        fn fmt_code(ren: *Renderer, code: ir.TextBlock) std.fmt.Formatter(format_code) {
+            return .{ .data = .{ ren, code } };
+        }
+
+        fn format_code(args: struct { *Renderer, ir.TextBlock }, fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            const ren: *Renderer, const code: ir.TextBlock = args;
+
+            _ = fmt;
+            _ = options;
+
+            const text = code.text;
+
+            var pos: usize = 0;
+            while (std.mem.indexOfPos(u8, text, pos, "${")) |index| {
+                try writer.writeAll(text[pos..index]);
+
+                const end = std.mem.indexOfScalarPos(u8, text, index + 2, '}') orelse {
+                    try writer.writeAll("${");
+                    pos += 2;
+                    continue;
+                };
+
+                const name = text[index + 2 .. end];
+
+                try ren.required_states.put(name, {});
+
+                try writer.print("sm.data.{}", .{
+                    fmt_id(name),
+                });
+
+                pos = end + 1;
+            }
+
+            try writer.writeAll(text[pos..]);
+        }
+
+        fn writeAll(ren: *Renderer, str: []const u8) !void {
+            try ren.writer.writeAll(str);
+        }
+
+        fn print(ren: *Renderer, comptime fmt: []const u8, args: anytype) !void {
+            try ren.writer.print(fmt, args);
+        }
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var renderer: Renderer = .{
+        .writer = stream,
+        .pgm = pgm,
+        .offset_to_state = .init(arena.allocator()),
+        .label_to_state = .init(arena.allocator()),
+        .required_states = .init(arena.allocator()),
+        .required_asyncs = .init(arena.allocator()),
+    };
+
+    try renderer.run();
+}
