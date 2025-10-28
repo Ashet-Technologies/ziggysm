@@ -55,7 +55,7 @@ pub fn main() !u8 {
 
         for (program.structure) |node| {
             switch (node) {
-                .state_machine => |sm| try render(allocator, sm, sink.writer()),
+                .state_machine => |sm| try render(allocator, program, sm, sink.writer()),
                 .top_level_code => |code| try sink.appendSlice(code.text), // no processing of global replacements
             }
         }
@@ -166,20 +166,22 @@ pub const Parser = struct {
             .@"async" => {
                 const name = parser.tokenizer.next_word() orelse return error.SyntaxError;
 
-                const argv = try parser.next_parens_list();
+                const argv = try parser.next_parameter_list();
 
                 const return_type = parser.tokenizer.lex_raw_code(.{
                     .nest_braces = true,
                     .nest_parens = true,
                     .only_nesting_group = false,
                     .stop_chars = ";",
-                    .include_stop_char = true,
+                    .include_stop_char = false,
                 });
+
+                try parser.accept_literal(";");
 
                 return .{
                     .async_func = .{
                         .name = name,
-                        .arguments = argv,
+                        .parameters = argv,
                         .return_type = .{ .text = return_type },
                     },
                 };
@@ -203,7 +205,7 @@ pub const Parser = struct {
     fn accept_state_machine(parser: *Parser) !ast.StateMachine {
         const name = parser.tokenizer.next_word() orelse return error.SyntaxError;
 
-        const argv = try parser.next_parens_list();
+        const argv = try parser.next_parameter_list();
 
         const return_type = parser.tokenizer.lex_raw_code(.{
             .nest_braces = true,
@@ -217,7 +219,7 @@ pub const Parser = struct {
 
         return .{
             .name = name,
-            .arguments = argv,
+            .parameters = argv,
             .return_type = .{ .text = return_type },
             .body = body,
         };
@@ -388,7 +390,7 @@ pub const Parser = struct {
 
         return .{
             .function_name = name,
-            .parameters = argv,
+            .arguments = argv,
             .output_to = result_target,
             .with_try = with_try,
             .as_state = as_state,
@@ -407,6 +409,46 @@ pub const Parser = struct {
         if (!parser.tokenizer.starts_with(text))
             return error.SyntaxError;
         parser.tokenizer.pos += text.len;
+    }
+
+    pub fn next_parameter_list(parser: *Parser) ![]ast.Parameter {
+        const tokenizer: *Tokenizer = parser.tokenizer;
+
+        try parser.accept_literal("(");
+
+        var list: std.ArrayList(ast.Parameter) = .init(parser.allocator);
+        defer list.deinit();
+
+        while (true) {
+            tokenizer.skip_space();
+
+            if (tokenizer.peek() == ')')
+                break;
+
+            const name = tokenizer.next_word() orelse return error.MissingParameterName;
+
+            try parser.accept_literal(":");
+
+            const type_name = tokenizer.lex_raw_code(.{
+                .nest_braces = true,
+                .nest_parens = true,
+                .stop_chars = ",)",
+                .only_nesting_group = false,
+                .include_stop_char = false,
+            });
+
+            try list.append(.{
+                .name = name,
+                .type = .{ .text = type_name },
+            });
+
+            if (!parser.try_accept_literal(","))
+                break;
+        }
+
+        try parser.accept_literal(")");
+
+        return try list.toOwnedSlice();
     }
 
     pub fn next_parens_list(parser: *Parser) ![]ast.TextBlock {
@@ -697,15 +739,20 @@ pub const ast = struct {
         async_func: AsyncFunction,
     };
 
+    pub const Parameter = struct {
+        name: []const u8,
+        type: TextBlock,
+    };
+
     pub const AsyncFunction = struct {
         name: []const u8,
-        arguments: []const TextBlock,
+        parameters: []const Parameter,
         return_type: TextBlock,
     };
 
     pub const StateMachine = struct {
         name: []const u8,
-        arguments: []const TextBlock,
+        parameters: []const Parameter,
         return_type: TextBlock,
         body: Block,
     };
@@ -738,12 +785,12 @@ pub const ast = struct {
         as_state: bool,
         output_to: ?TextBlock,
         function_name: []const u8,
-        parameters: []const TextBlock,
+        arguments: []const TextBlock,
     };
 
     pub const Jump = struct {
         jump_to: []const u8,
-        parameters: []const TextBlock,
+        arguments: []const TextBlock,
     };
 
     pub const Return = struct {
@@ -797,13 +844,13 @@ pub const ast = struct {
                         .async_func => |func| {
                             try dmp.stream.print("async {s}({any}) {}\n", .{
                                 func.name,
-                                func.arguments,
+                                func.parameters,
                                 func.return_type,
                             });
                         },
 
                         .process, .state_machine, .sub_machine => |sm| {
-                            try dmp.stream.print("{s} {s}({any}) {}\n", .{ @tagName(node), sm.name, sm.arguments, sm.return_type });
+                            try dmp.stream.print("{s} {s}({any}) {}\n", .{ @tagName(node), sm.name, sm.parameters, sm.return_type });
                             try dmp.block(sm.body, 0);
                         },
                     }
@@ -837,7 +884,7 @@ pub const ast = struct {
                             @tagName(stmt),
                             if (call.with_try) " $try" else "",
                             call.function_name,
-                            call.parameters,
+                            call.arguments,
                         });
                         if (call.output_to) |output| {
                             try dmp.stream.print("-> {s}{}", .{
@@ -897,6 +944,7 @@ const ir = struct {
         arena: std.heap.ArenaAllocator,
 
         structure: []Node,
+        suspenders: std.StringArrayHashMap(Suspender),
 
         pub fn deinit(pgm: *Program) void {
             pgm.arena.deinit();
@@ -907,6 +955,14 @@ const ir = struct {
     pub const Node = union(enum) {
         state_machine: StateMachine,
         top_level_code: TextBlock,
+    };
+
+    pub const Suspender = struct {
+        name: []const u8,
+        parameters: []const Parameter,
+        return_type: TextBlock,
+
+        pub const Parameter = ast.Parameter;
     };
 
     pub const StateMachine = struct {
@@ -1026,12 +1082,23 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
 
     var structure: std.ArrayList(ir.Node) = .init(arena.allocator());
 
+    var suspenders: std.StringArrayHashMap(ir.Suspender) = .init(arena.allocator());
+
     // TODO: Create an index for all process, asyncs and submachines:
     for (document.top_level_nodes) |node| {
         switch (node) {
             .state_machine, .raw_code => continue,
 
-            .async_func => {},
+            .async_func => |suspender| {
+                const previous = try suspenders.fetchPut(suspender.name, .{
+                    .name = suspender.name,
+                    .parameters = suspender.parameters,
+                    .return_type = suspender.return_type,
+                });
+                if (previous != null)
+                    return error.DuplicateSuspender;
+            },
+
             .process => {},
             .sub_machine => {},
         }
@@ -1053,6 +1120,7 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
             .instructions = .init(arena.allocator()),
             .labels = .init(arena.allocator()),
             .tagged_labels = .init(arena.allocator()),
+            .suspenders = &suspenders,
         };
 
         _ = try cg.generate(sm.*, true);
@@ -1082,6 +1150,7 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
     return .{
         .arena = arena,
         .structure = try structure.toOwnedSlice(),
+        .suspenders = suspenders,
     };
 }
 
@@ -1093,6 +1162,8 @@ const CodeGen = struct {
     };
 
     allocator: std.mem.Allocator,
+    suspenders: *std.StringArrayHashMap(ir.Suspender),
+
     instructions: std.ArrayList(ir.Instruction),
 
     labels: std.ArrayList(*Label),
@@ -1165,7 +1236,7 @@ const CodeGen = struct {
         is_toplevel: bool,
     };
 
-    fn generate_block(cg: *CodeGen, block: ast.Block, ctx: BlockContext) error{ OutOfMemory, SyntaxError, BreakOutsideLoop, ValueReturnOnToplevel }!void {
+    fn generate_block(cg: *CodeGen, block: ast.Block, ctx: BlockContext) error{ OutOfMemory, SyntaxError, BreakOutsideLoop, ValueReturnOnToplevel, UnknownSuspender, ParameterMismatch }!void {
         for (block.statements) |stmt| {
             try cg.generate_stmt(stmt, ctx);
         }
@@ -1183,9 +1254,14 @@ const CodeGen = struct {
             },
 
             .yield => |yield| {
+                const suspender = cg.suspenders.get(yield.function_name) orelse return error.UnknownSuspender;
+
+                if (yield.arguments.len != suspender.parameters.len)
+                    return error.ParameterMismatch;
+
                 try cg.emit(.{ .yield = .{
                     .function = yield.function_name,
-                    .arguments = yield.parameters,
+                    .arguments = yield.arguments,
                     .output = if (yield.output_to) |output_to|
                         if (yield.as_state)
                             .{ .text = try std.fmt.allocPrint(cg.allocator, "${{{s}}}", .{output_to.text}) }
@@ -1198,7 +1274,7 @@ const CodeGen = struct {
             },
 
             .call => |call| {
-                for (call.parameters) |param| {
+                for (call.arguments) |param| {
                     // TODO: Emit call
                     _ = param;
                 }
@@ -1310,7 +1386,7 @@ const CodeGen = struct {
     }
 };
 
-fn render(allocator: std.mem.Allocator, pgm: ir.StateMachine, stream: anytype) !void {
+fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, stream: anytype) !void {
     const fmt_id = std.zig.fmtId;
 
     const Renderer = struct {
@@ -1337,7 +1413,8 @@ fn render(allocator: std.mem.Allocator, pgm: ir.StateMachine, stream: anytype) !
 
         writer: Writer,
         states: usize = 0,
-        pgm: ir.StateMachine,
+        program: ir.Program,
+        sm: ir.StateMachine,
 
         offset_to_state: std.AutoArrayHashMap(usize, State),
         label_to_state: std.AutoArrayHashMap(ir.Label, State),
@@ -1375,7 +1452,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.StateMachine, stream: anytype) !
 
             try ren.offset_to_state.putNoClobber(0, .initial);
 
-            for (ren.pgm.labels.values()) |value| {
+            for (ren.sm.labels.values()) |value| {
                 const offset = value.offset.?;
 
                 const gop = try ren.offset_to_state.getOrPut(offset);
@@ -1384,12 +1461,12 @@ fn render(allocator: std.mem.Allocator, pgm: ir.StateMachine, stream: anytype) !
                 gop.value_ptr.* = try ren.alloc_state();
             }
 
-            for (ren.pgm.labels.keys(), ren.pgm.labels.values()) |key, value| {
+            for (ren.sm.labels.keys(), ren.sm.labels.values()) |key, value| {
                 try ren.label_to_state.putNoClobber(key, ren.offset_to_state.get(value.offset.?).?);
             }
 
             var last_result: RenderResult = .default;
-            for (ren.pgm.instructions, 0..) |instr, offset| {
+            for (ren.sm.instructions, 0..) |instr, offset| {
                 if (ren.offset_to_state.get(offset)) |state| {
                     try ren.write_new_state(state, (last_result != .switches_state));
                 }
@@ -1431,17 +1508,28 @@ fn render(allocator: std.mem.Allocator, pgm: ir.StateMachine, stream: anytype) !
             try ren.writeAll("  const ReturnValue = union(enum) {\n");
             try ren.writeAll("      launch,\n\n");
             for (ren.required_asyncs.keys()) |async_func| {
-                try ren.print("      {},", .{
+                const suspender = ren.program.suspenders.get(async_func).?;
+
+                try ren.print("      {}: {},\n", .{
                     fmt_id(async_func),
+                    fmt_raw(suspender.return_type),
                 });
             }
             try ren.writeAll("  };\n\n");
             try ren.writeAll("  const Result = union(enum) {\n");
             try ren.writeAll("      stop,\n\n");
             for (ren.required_asyncs.keys()) |async_func| {
-                try ren.print("      {}: struct{{}},", .{
+                const suspender = ren.program.suspenders.get(async_func).?;
+
+                try ren.print("      {}: struct{{", .{
                     fmt_id(async_func),
                 });
+                for (suspender.parameters, 0..) |param, index| {
+                    if (index > 0)
+                        try ren.writeAll(", ");
+                    try ren.print("{}", .{fmt_raw(param.type)});
+                }
+                try ren.writeAll("},\n");
             }
 
             try ren.writeAll("  };\n\n");
@@ -1556,6 +1644,16 @@ fn render(allocator: std.mem.Allocator, pgm: ir.StateMachine, stream: anytype) !
             ren.current_state = new_state;
         }
 
+        fn fmt_raw(code: ir.TextBlock) std.fmt.Formatter(format_raw) {
+            return .{ .data = code };
+        }
+
+        fn format_raw(code: ir.TextBlock, fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            _ = fmt;
+            _ = options;
+            try writer.writeAll(code.text);
+        }
+
         fn fmt_code(ren: *Renderer, code: ir.TextBlock) std.fmt.Formatter(format_code) {
             return .{ .data = .{ ren, code } };
         }
@@ -1606,7 +1704,8 @@ fn render(allocator: std.mem.Allocator, pgm: ir.StateMachine, stream: anytype) !
 
     var renderer: Renderer = .{
         .writer = stream,
-        .pgm = pgm,
+        .program = pgm,
+        .sm = sm,
         .offset_to_state = .init(arena.allocator()),
         .label_to_state = .init(arena.allocator()),
         .required_states = .init(arena.allocator()),

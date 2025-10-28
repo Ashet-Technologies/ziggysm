@@ -14,7 +14,7 @@ $statemachine Basic() void {
         $yield write_byte(${output});
     }
 }
-          
+
 test SM {
     {
         var sm: SM = .{};
