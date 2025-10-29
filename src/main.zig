@@ -1429,6 +1429,8 @@ const CodeGen = struct {
                 try cg.emit(.{
                     .branch = .{ .target = target.id },
                 });
+
+                try cg.add_sm_dependency(jmp.function_name);
             },
 
             .@"return" => |ret| {
@@ -1630,7 +1632,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             try ren.offset_to_state.putNoClobber(0, .initial);
 
             for (ren.sm.labels.values()) |value| {
-                const offset = value.offset.?;
+                const offset = value.offset orelse @panic("not all labels are defined!");
 
                 const gop = try ren.offset_to_state.getOrPut(offset);
                 if (gop.found_existing)
@@ -1671,16 +1673,14 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             try ren.writeAll("  const BranchSet = struct {\n");
 
             for (ren.required_dynbranch.keys()) |branch| {
-                try ren.print("{}: ?State = null,\n", .{
-                    fmt_id(branch),
-                });
+                try ren.print("{}: ?State = null,\n", .{fmt_id(branch)});
             }
 
             try ren.writeAll("  };\n\n");
             try ren.writeAll("  const Data = struct {\n");
 
             for (ren.required_states.keys()) |state_name| {
-                try ren.print("{}: u8 = undefined,\n", .{
+                try ren.print("{}: u8 = undefined,\n", .{ // TODO: Implement proper state types here!
                     fmt_id(state_name),
                 });
             }

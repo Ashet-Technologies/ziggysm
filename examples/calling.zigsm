@@ -12,7 +12,6 @@ $statemachine Calling() void {
         }
 
         $call WriteTwice(${output});
-
     }
 }
 

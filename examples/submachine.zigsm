@@ -1,0 +1,66 @@
+const std = @import("std");
+
+$async write_byte(data: u8) void;
+$async read_byte() u8;
+
+$statemachine SubMachine() void {
+    $jump First();
+}
+
+$submachine First() void {
+    $while(true) {
+        $yield read_byte() -> $state output;
+
+        $if(${output} == 0) {
+            $return;
+        }
+        $if(${output} == 2) {
+            $call Second();
+        }
+
+        $yield write_byte(1);
+    }
+}
+
+$submachine Second() void {
+    $while(true) {
+        $yield read_byte() -> $state output;
+
+        $if(${output} == 0) {
+            $return;
+        }
+        $if(${output} == 1) {
+            $call First();
+        }
+
+        $yield write_byte(2);
+    }
+}
+
+test SubMachine {
+    const SM = SubMachine;
+    {
+        var sm: SM = .{};
+        try std.testing.expect(.read_byte == try sm.step(.launch));
+        try std.testing.expect(.stop == try sm.step(.{ .read_byte = 0 }));
+    }
+    {
+        var sm: SM = .{};
+        try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.launch));
+        try std.testing.expectEqual(SM.Result{.write_byte=.{1}}, try sm.step(.{ .read_byte = 10 }));
+        try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
+        try std.testing.expectEqual(SM.Result{.write_byte=.{1}}, try sm.step(.{ .read_byte = 12 }));
+        try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
+        try std.testing.expectEqual(SM.Result.read_byte, try sm.step(.{ .read_byte = 2 }));
+        try std.testing.expectEqual(SM.Result{.write_byte=.{2}}, try sm.step(.{ .read_byte = 14 }));
+        try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
+        try std.testing.expectEqual(SM.Result{.write_byte=.{2}}, try sm.step(.{ .read_byte = 16 }));
+        try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
+        try std.testing.expectEqual(SM.Result.read_byte, try sm.step(.{ .read_byte = 1 }));
+        try std.testing.expectEqual(SM.Result{.write_byte=.{1}}, try sm.step(.{ .read_byte = 18 }));
+        try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
+        try std.testing.expectEqual(SM.Result{.write_byte=.{1}}, try sm.step(.{ .read_byte = 20 }));
+        try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
+        try std.testing.expectEqual(SM.Result.stop , try sm.step(.{ .read_byte = 0 }));
+    }
+}
