@@ -1027,6 +1027,8 @@ const ir = struct {
     };
 
     pub const Instruction = union(enum) {
+        pub const Tag = @typeInfo(Instruction).@"union".tag_type.?;
+
         stop,
         execute: TextBlock,
 
@@ -1203,12 +1205,14 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
             });
         }
 
-        try structure.append(.{ .state_machine = .{
+        const generated_sm: ir.StateMachine = .{
             .name = sm.name,
             .instructions = instructions,
             .labels = labels,
             .submachines = cg.tagged_labels,
-        } });
+        };
+
+        try structure.append(.{ .state_machine = generated_sm });
     }
 
     return .{
@@ -1319,9 +1323,34 @@ const CodeGen = struct {
 
         try cg.generate_block(sm.body, ctx);
 
-        // last statement is an implicit return, which turns into STOP
-        // for statemachine and submachine and into RET for procs
-        try cg.generate_stmt(.{ .@"return" = .{ .value = null } }, ctx);
+        const last_instr = if (cg.instructions.items.len > 0)
+            @as(ir.Instruction.Tag, cg.instructions.items[cg.instructions.items.len - 1])
+        else
+            null;
+
+        const last_is_branch = (last_instr == .stop or last_instr == .branch);
+
+        const any_jumps_to_end = for (cg.labels.items) |lbl| {
+            if (lbl.offset == cg.instructions.items.len)
+                break true;
+        } else false;
+
+        // We do need an additional STOP/RETURN instruction if
+        // the previous instruction was not a branch (and would fall through otherwise)
+        // and we also need it if any part of the code jumps to the end of the code
+        // (which would also "fall through" then):
+        if (!last_is_branch or any_jumps_to_end) {
+            // last statement is an implicit return, which turns into STOP
+            // for statemachine and submachine and into RET for procs
+            try cg.generate_stmt(.{ .@"return" = .{ .value = null } }, ctx);
+        }
+
+        // Assert all labels point to at least one instruction:
+        for (cg.labels.items) |lbl| {
+            if (lbl.offset) |offset| {
+                std.debug.assert(offset < cg.instructions.items.len);
+            }
+        }
 
         return sm_label.id;
     }
@@ -1545,7 +1574,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
 
         const StateType = enum(u4) {
             builtin = 0,
-            label = 1,
+            offset = 1,
             yield = 2,
             branch = 3,
         };
@@ -1607,6 +1636,16 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             return state;
         }
 
+        fn alloc_state_from_offset(ren: *Renderer, offset: usize) !State {
+            const mask: State.Mask = .{
+                .type = .offset,
+                .index = @intCast(offset),
+            };
+            const state: State = @enumFromInt(@as(u64, @bitCast(mask)));
+            try ren.states.put(state, {});
+            return state;
+        }
+
         fn state_from_offset(ren: *Renderer, offset: usize) ?State {
             return ren.offset_to_state.get(offset);
         }
@@ -1637,7 +1676,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                 const gop = try ren.offset_to_state.getOrPut(offset);
                 if (gop.found_existing)
                     continue;
-                gop.value_ptr.* = try ren.alloc_state(.label);
+                gop.value_ptr.* = try ren.alloc_state_from_offset(offset);
             }
 
             for (ren.sm.labels.keys(), ren.sm.labels.values()) |key, value| {
@@ -1848,7 +1887,27 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                 }
                 try ren.writeAll("    },\n");
             }
-            try ren.print("    .{} => {{\n", .{new_state});
+            try ren.print("    .{} => {{", .{new_state});
+
+            // render the associated labels for each state:
+            {
+                var any_label = false;
+                for (ren.label_to_state.keys(), ren.label_to_state.values()) |key, value| {
+                    if (new_state != value)
+                        continue;
+
+                    if (!any_label) {
+                        try ren.writeAll(" // ");
+                    } else {
+                        try ren.writeAll(", ");
+                    }
+
+                    any_label = true;
+                    try ren.print("{}", .{key});
+                }
+            }
+
+            try ren.writeAll("\n");
             ren.current_state = new_state;
         }
 

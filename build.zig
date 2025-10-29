@@ -3,6 +3,7 @@ const std = @import("std");
 const examples = [_][]const u8{
     "examples/basic.zigsm",
     "examples/calling.zigsm",
+    "examples/submachine.zigsm",
 };
 
 pub fn build(b: *std.Build) void {
