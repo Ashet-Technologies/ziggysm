@@ -15,17 +15,17 @@ $statemachine Basic() void {
     }
 }
 
-test SM {
+test Basic {
     {
-        var sm: SM = .{};
+        var sm: Basic = .{};
         try std.testing.expect(.read_byte == try sm.step(.launch));
         try std.testing.expect(.stop == try sm.step(.{ .read_byte = 0 }));
     }
     {
-        var sm: SM = .{};
-        try std.testing.expect(.read_byte == try sm.step(.launch));
-        try std.testing.expect(.write_byte == try sm.step(.{ .read_byte = 10 }));
-        try std.testing.expect(.read_byte == try sm.step(.write_byte));
-        try std.testing.expect(.stop == try sm.step(.{ .read_byte = 0 }));
+        var sm: Basic = .{};
+        try std.testing.expectEqual(Basic.Result.read_byte , try sm.step(.launch));
+        try std.testing.expectEqual(Basic.Result{.write_byte=.{10}}, try sm.step(.{ .read_byte = 10 }));
+        try std.testing.expectEqual(Basic.Result.read_byte , try sm.step(.write_byte));
+        try std.testing.expectEqual(Basic.Result.stop , try sm.step(.{ .read_byte = 0 }));
     }
 }

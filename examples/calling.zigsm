@@ -1,0 +1,38 @@
+const std = @import("std");
+
+$async write_byte(data: u8) void;
+$async read_byte() u8;
+
+$statemachine Calling() void {
+    $while(true) {
+        $yield read_byte() -> $state output;
+
+        $if(${output} == 0) {
+            $return;
+        }
+
+        $call WriteTwice(${output});
+
+    }
+}
+
+$proc WriteTwice(value: u8) void {
+    $yield write_byte(${value});
+    $yield write_byte(${value});
+}
+
+test Calling {
+    {
+        var sm: Calling = .{};
+        try std.testing.expect(.read_byte == try sm.step(.launch));
+        try std.testing.expect(.stop == try sm.step(.{ .read_byte = 0 }));
+    }
+    {
+        var sm: Calling = .{};
+        try std.testing.expectEqual(Calling.Result.read_byte , try sm.step(.launch));
+        try std.testing.expectEqual(Calling.Result{.write_byte=.{10}}, try sm.step(.{ .read_byte = 10 }));
+        try std.testing.expectEqual(Calling.Result{.write_byte=.{10}} , try sm.step(.write_byte));
+        try std.testing.expectEqual(Calling.Result.read_byte , try sm.step(.write_byte));
+        try std.testing.expectEqual(Calling.Result.stop , try sm.step(.{ .read_byte = 0 }));
+    }
+}
