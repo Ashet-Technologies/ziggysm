@@ -1671,7 +1671,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             try ren.writeAll("  const BranchSet = struct {\n");
 
             for (ren.required_dynbranch.keys()) |branch| {
-                try ren.print("{}: State = undefined,\n", .{
+                try ren.print("{}: ?State = null,\n", .{
                     fmt_id(branch),
                 });
             }
@@ -1759,6 +1759,11 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     const hopstate = try ren.alloc_state(.branch);
 
                     try ren.required_dynbranch.put(call.dest_variable, {});
+                    try ren.print("      if(sm.branches.{} != null) @panic(\"A recursive CALL to {} was detected at runtime.\");\n", .{
+                        fmt_id(call.dest_variable),
+                        std.zig.fmtEscapes(call.dest_variable),
+                    });
+
                     try ren.print("      sm.branches.{} = .{};\n", .{ fmt_id(call.dest_variable), hopstate });
 
                     const target_state = ren.state_from_label(call.target);
@@ -1772,7 +1777,14 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                 .ret => |ret| {
                     try ren.required_dynbranch.put(ret.dest_variable, {});
 
-                    try ren.print("      sm.state = sm.branches.{};\n", .{fmt_id(ret.dest_variable)});
+                    // 1. Fetch the return state
+                    try ren.print("      sm.state = sm.branches.{} orelse @panic(\"RET was reached without a previous CALL for proc {}\");\n", .{
+                        fmt_id(ret.dest_variable),
+                        std.zig.fmtEscapes(ret.dest_variable),
+                    });
+                    // 2. Reset the state such that another RET would panic
+                    try ren.print("      sm.branches.{} = null;\n", .{fmt_id(ret.dest_variable)});
+                    // 3. Perform the actual branch to the return location
                     try ren.print("      continue :__sm__ sm.state;\n", .{});
 
                     return .switches_state;
