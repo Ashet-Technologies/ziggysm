@@ -1012,7 +1012,7 @@ const ir = struct {
 
         labels: std.AutoArrayHashMap(Label, LabelData), // id => label info
         submachines: std.StringArrayHashMap(Label), // string => id
-        // states: std.StringArrayHashMap(TextBlock), // name => type
+        states: std.StringArrayHashMap(TextBlock), // name => type
         instructions: []Instruction,
     };
 
@@ -1180,6 +1180,7 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
             .submachines = &submachines,
             .emitted_machines = .init(arena.allocator()),
             .required_machines = .init(arena.allocator()),
+            .state_variables = .init(arena.allocator()),
         };
 
         _ = try cg.generate(sm.*, true);
@@ -1210,6 +1211,7 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
             .instructions = instructions,
             .labels = labels,
             .submachines = cg.tagged_labels,
+            .states = cg.state_variables,
         };
 
         try structure.append(.{ .state_machine = generated_sm });
@@ -1244,6 +1246,8 @@ const CodeGen = struct {
 
     emitted_machines: std.StringArrayHashMap(void),
     required_machines: std.StringArrayHashMap(void),
+
+    state_variables: std.StringArrayHashMap(ir.TextBlock), // name => type
 
     instructions: std.ArrayList(ir.Instruction),
 
@@ -1321,6 +1325,10 @@ const CodeGen = struct {
             .is_toplevel = is_toplevel,
         };
 
+        for (sm.parameters) |param| {
+            try cg.add_state_var(try cg.get_state_name(sm.name, .{ .parameter = param.name }), .global(param.type));
+        }
+
         try cg.generate_block(sm.body, ctx);
 
         const last_instr = if (cg.instructions.items.len > 0)
@@ -1378,10 +1386,19 @@ const CodeGen = struct {
         UnknownSuspender,
         ParameterMismatch,
         UnknownStateMachine,
+        DuplicateState,
     }!void {
         for (block.statements) |stmt| {
             try cg.generate_stmt(stmt, ctx);
         }
+    }
+
+    fn add_state_var(cg: *CodeGen, name: []const u8, type_name: ir.TextBlock) !void {
+        std.log.info("var {s}: {s}", .{ name, type_name });
+        const gop = try cg.state_variables.getOrPut(name);
+        if (gop.found_existing)
+            return error.DuplicateState;
+        gop.value_ptr.* = type_name;
     }
 
     fn generate_stmt(cg: *CodeGen, stmt: ast.Statement, ctx: BlockContext) !void {
@@ -1389,6 +1406,7 @@ const CodeGen = struct {
             .raw_code => |code| try cg.emit(.{ .execute = ctx.local(code) }),
 
             .state_variable => |state| {
+                try cg.add_state_var(state.variable_name, .global(state.type_spec));
                 try cg.emit(.{ .set_state = .{
                     .variable = state.variable_name,
                     .value = ctx.local(state.initial_value),
@@ -1400,6 +1418,15 @@ const CodeGen = struct {
 
                 if (yield.arguments.len != suspender.parameters.len)
                     return error.ParameterMismatch;
+
+                if (yield.output_to) |output_to| {
+                    if (yield.as_state) {
+                        try cg.add_state_var(
+                            try cg.get_state_name(ctx.scope, .{ .local = output_to.text }),
+                            suspender.return_type,
+                        );
+                    }
+                }
 
                 try cg.emit(.{ .yield = .{
                     .function = yield.function_name,
@@ -1694,6 +1721,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
 
             if (ren.needs_stop_state) {
                 try ren.write_new_state(.stopped, (last_result != .switches_state));
+                try ren.writeAll("        if (false) continue :__sm__ .stopped;\n");
                 try ren.writeAll("        @panic(\"The state machine has stopped and can no longer be resumed!\");\n");
             }
 
@@ -1719,8 +1747,13 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             try ren.writeAll("  const Data = struct {\n");
 
             for (ren.required_states.keys()) |state_name| {
-                try ren.print("{}: u8 = undefined,\n", .{ // TODO: Implement proper state types here!
+                const state_type = ren.sm.states.get(state_name) orelse {
+                    std.log.err("use of undeclared state {s}", .{state_name});
+                    @panic("used undeclared state");
+                };
+                try ren.print("{}: {} = undefined,\n", .{ // TODO: Implement proper state types here!
                     fmt_id(state_name),
+                    fmt_raw(state_type),
                 });
             }
 

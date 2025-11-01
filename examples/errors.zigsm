@@ -1,0 +1,17 @@
+const std = @import("std");
+
+$async read_byte() error{Timeout}!u8;
+
+$statemachine ErrorHandling() void {
+    $yield read_byte();
+}
+
+test ErrorHandling {
+    const SM = ErrorHandling;
+
+    {
+        var sm: SM = .{};
+        try std.testing.expect(.write_byte == try sm.step(.launch));
+        try std.testing.expect(.stop == try sm.step(.{ .write_byte = 0 }));
+    }
+}
