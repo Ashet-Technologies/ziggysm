@@ -4,6 +4,7 @@ const examples = [_][]const u8{
     "examples/basic.zigsm",
     "examples/calling.zigsm",
     "examples/submachine.zigsm",
+    "examples/errors.zigsm",
 };
 
 pub fn build(b: *std.Build) void {

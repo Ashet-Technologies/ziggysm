@@ -1721,7 +1721,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
 
             if (ren.needs_stop_state) {
                 try ren.write_new_state(.stopped, (last_result != .switches_state));
-                try ren.writeAll("        if (false) continue :__sm__ .stopped;\n");
+                try ren.writeAll("        if (false) break :__sm__ .stopped;\n");
                 try ren.writeAll("        @panic(\"The state machine has stopped and can no longer be resumed!\");\n");
             }
 
@@ -1747,10 +1747,16 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             try ren.writeAll("  const Data = struct {\n");
 
             for (ren.required_states.keys()) |state_name| {
-                const state_type = ren.sm.states.get(state_name) orelse {
+                const raw_state_type = ren.sm.states.get(state_name) orelse {
                     std.log.err("use of undeclared state {s}", .{state_name});
                     @panic("used undeclared state");
                 };
+
+                const state_type: ir.TextBlock = if (std.mem.indexOfScalar(u8, raw_state_type.text, '!')) |index|
+                    .{ .text = raw_state_type.text[index + 1 ..], .scope = null }
+                else
+                    raw_state_type;
+
                 try ren.print("{}: {} = undefined,\n", .{ // TODO: Implement proper state types here!
                     fmt_id(state_name),
                     fmt_raw(state_type),
@@ -1884,14 +1890,16 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     });
 
                     if (yield.output) |output_target| {
-                        try ren.print("{s} = ", .{ren.fmt_code(output_target)});
-                        if (yield.use_try) {
-                            try ren.writeAll("try ");
-                        }
-                        try ren.print("resume_val.{};\n", .{fmt_id(yield.function)});
+                        try ren.print("{s}", .{ren.fmt_code(output_target)});
                     } else {
-                        std.debug.assert(yield.use_try == false);
+                        // Discard the value so we catch the problem when we're silenty ignoring an error:
+                        try ren.writeAll("_");
                     }
+                    try ren.writeAll(" = ");
+                    if (yield.use_try) {
+                        try ren.writeAll("try ");
+                    }
+                    try ren.print("resume_val.{};\n", .{fmt_id(yield.function)});
 
                     return .default;
                 },

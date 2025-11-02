@@ -2,8 +2,13 @@ const std = @import("std");
 
 $async read_byte() error{Timeout}!u8;
 
+$async write_byte(output: u8) error{Timeout}!void;
+
+
 $statemachine ErrorHandling() void {
-    $yield read_byte();
+    $yield $try read_byte() -> $state data;
+
+    $yield $try write_byte(${data});
 }
 
 test ErrorHandling {
@@ -11,7 +16,21 @@ test ErrorHandling {
 
     {
         var sm: SM = .{};
-        try std.testing.expect(.write_byte == try sm.step(.launch));
-        try std.testing.expect(.stop == try sm.step(.{ .write_byte = 0 }));
+        try std.testing.expectEqual(SM.Result.read_byte, try sm.step(.launch));
+        try std.testing.expectEqual(SM.Result{ .write_byte=.{15} }, try sm.step(.{ .read_byte = 15 }));
+        try std.testing.expectEqual(SM.Result.stop, try sm.step(.{ .write_byte = {} }));
+    }
+
+    {
+        var sm: SM = .{};
+        try std.testing.expectEqual(SM.Result.read_byte, try sm.step(.launch));
+        try std.testing.expectEqual(error.Timeout, sm.step(.{ .read_byte = error.Timeout }));
+    }
+
+    {
+        var sm: SM = .{};
+        try std.testing.expectEqual(SM.Result.read_byte, try sm.step(.launch));
+        try std.testing.expectEqual(SM.Result{ .write_byte=.{15} }, try sm.step(.{ .read_byte = 15 }));
+        try std.testing.expectEqual(error.Timeout,  sm.step(.{ .write_byte = error.Timeout }));
     }
 }
