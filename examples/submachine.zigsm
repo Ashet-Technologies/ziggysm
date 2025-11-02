@@ -1,7 +1,7 @@
 const std = @import("std");
 
-$async write_byte(data: u8) void;
-$async read_byte() u8;
+$suspender write_byte(data: u8) void;
+$suspender read_byte() u8;
 
 $statemachine SubMachine() void {
     $jump First();

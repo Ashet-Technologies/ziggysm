@@ -46,8 +46,8 @@ pub fn init(
     };
 }
 
-$async write_byte(data: u8) error{Timeout}!void;
-$async read_byte() error{Timeout}!u8;
+$suspender write_byte(data: u8) error{Timeout}!void;
+$suspender read_byte() error{Timeout}!u8;
 
 $statemachine PS2(dri: *Generic_PS2_Device) (error{NoDevice} || IO_Error)!void
 {

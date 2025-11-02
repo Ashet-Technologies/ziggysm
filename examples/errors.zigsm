@@ -1,8 +1,8 @@
 const std = @import("std");
 
-$async read_byte() error{Timeout}!u8;
+$suspender read_byte() error{Timeout}!u8;
 
-$async write_byte(output: u8) error{Timeout}!void;
+$suspender write_byte(output: u8) error{Timeout}!void;
 
 
 $statemachine ErrorHandling() void {

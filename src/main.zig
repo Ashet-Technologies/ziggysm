@@ -99,7 +99,7 @@ pub const TopLevelToken = Token(enum {
     // toplevel
     statemachine,
     submachine,
-    @"async",
+    suspender,
     proc,
 });
 
@@ -163,7 +163,7 @@ pub const Parser = struct {
         switch (token.type) {
             .plain_code => return .{ .raw_code = .{ .text = token.text } },
 
-            .@"async" => {
+            .suspender => {
                 const name = parser.tokenizer.next_word() orelse return error.SyntaxError;
 
                 const argv = try parser.next_parameter_list();
@@ -179,7 +179,7 @@ pub const Parser = struct {
                 try parser.accept_literal(";");
 
                 return .{
-                    .async_func = .{
+                    .suspender = .{
                         .name = name,
                         .parameters = argv,
                         .return_type = .{ .text = return_type },
@@ -584,8 +584,8 @@ const Tokenizer = struct {
         if (head == '$') {
             const keyword = tokenizer.lex_keyword();
 
-            if (std.mem.eql(u8, keyword, "$async"))
-                return .{ .type = .@"async", .text = keyword };
+            if (std.mem.eql(u8, keyword, "$suspender"))
+                return .{ .type = .suspender, .text = keyword };
 
             if (std.mem.eql(u8, keyword, "$statemachine"))
                 return .{ .type = .statemachine, .text = keyword };
@@ -736,7 +736,7 @@ pub const ast = struct {
         state_machine: StateMachine,
         sub_machine: StateMachine,
         process: StateMachine,
-        async_func: AsyncFunction,
+        suspender: Suspender,
     };
 
     pub const Parameter = struct {
@@ -744,7 +744,7 @@ pub const ast = struct {
         type: TextBlock,
     };
 
-    pub const AsyncFunction = struct {
+    pub const Suspender = struct {
         name: []const u8,
         parameters: []const Parameter,
         return_type: TextBlock,
@@ -841,8 +841,8 @@ pub const ast = struct {
                     switch (node) {
                         .raw_code => |code| try dmp.stream.print("{}\n", .{code}),
 
-                        .async_func => |func| {
-                            try dmp.stream.print("async {s}({any}) {}\n", .{
+                        .suspender => |func| {
+                            try dmp.stream.print("suspender {s}({any}) {}\n", .{
                                 func.name,
                                 func.parameters,
                                 func.return_type,
@@ -1132,12 +1132,12 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
     var suspenders: std.StringArrayHashMap(ir.Suspender) = .init(arena.allocator());
     var submachines: std.StringArrayHashMap(CodeGen.StateMachine) = .init(arena.allocator());
 
-    // TODO: Create an index for all process, asyncs and submachines:
+    // Create an index for all process, suspenders and submachines:
     for (document.top_level_nodes) |node| {
         switch (node) {
             .raw_code => continue,
 
-            .async_func => |suspender| {
+            .suspender => |suspender| {
                 const previous = try suspenders.fetchPut(suspender.name, .{
                     .name = suspender.name,
                     .parameters = try CodeGen.transpose_param_list(arena.allocator(), suspender.parameters),
@@ -1168,7 +1168,7 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
                 continue;
             },
 
-            .async_func, .process, .sub_machine => continue,
+            .suspender, .process, .sub_machine => continue,
         };
 
         var cg: CodeGen = .{
@@ -1648,7 +1648,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
         needs_stop_state: bool = false,
 
         required_states: std.StringArrayHashMap(void),
-        required_asyncs: std.StringArrayHashMap(void),
+        required_suspenders: std.StringArrayHashMap(void),
 
         required_dynbranch: std.StringArrayHashMap(void),
 
@@ -1766,22 +1766,22 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             try ren.writeAll("  };\n\n");
             try ren.writeAll("  const ReturnValue = union(enum) {\n");
             try ren.writeAll("      launch,\n\n");
-            for (ren.required_asyncs.keys()) |async_func| {
-                const suspender = ren.program.suspenders.get(async_func).?;
+            for (ren.required_suspenders.keys()) |suspender_id| {
+                const suspender = ren.program.suspenders.get(suspender_id).?;
 
                 try ren.print("      {}: {},\n", .{
-                    fmt_id(async_func),
+                    fmt_id(suspender_id),
                     fmt_raw(suspender.return_type),
                 });
             }
             try ren.writeAll("  };\n\n");
             try ren.writeAll("  const Result = union(enum) {\n");
             try ren.writeAll("      stop,\n\n");
-            for (ren.required_asyncs.keys()) |async_func| {
-                const suspender = ren.program.suspenders.get(async_func).?;
+            for (ren.required_suspenders.keys()) |suspender_id| {
+                const suspender = ren.program.suspenders.get(suspender_id).?;
 
                 try ren.print("      {}: struct{{", .{
-                    fmt_id(async_func),
+                    fmt_id(suspender_id),
                 });
                 for (suspender.parameters, 0..) |param, index| {
                     if (index > 0)
@@ -1869,7 +1869,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                 },
 
                 .yield => |yield| {
-                    try ren.required_asyncs.put(yield.function, {});
+                    try ren.required_suspenders.put(yield.function, {});
 
                     const hopstate = try ren.alloc_state(.yield);
 
@@ -2025,7 +2025,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
         .offset_to_state = .init(arena.allocator()),
         .label_to_state = .init(arena.allocator()),
         .required_states = .init(arena.allocator()),
-        .required_asyncs = .init(arena.allocator()),
+        .required_suspenders = .init(arena.allocator()),
         .required_dynbranch = .init(arena.allocator()),
     };
 
