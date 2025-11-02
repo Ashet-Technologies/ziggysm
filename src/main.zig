@@ -197,7 +197,7 @@ pub const Parser = struct {
             },
             .proc => {
                 const sm = try parser.accept_state_machine();
-                return .{ .process = sm };
+                return .{ .procedure = sm };
             },
         }
     }
@@ -307,6 +307,13 @@ pub const Parser = struct {
                     return .{ .if_condition = .{
                         .condition = condition,
                         .true_body = body,
+                    } };
+                }
+                if (std.mem.eql(u8, keyword, "$loop")) {
+                    const body = try parser.accept_block();
+
+                    return .{ .infinite_loop = .{
+                        .body = body,
                     } };
                 }
                 if (std.mem.eql(u8, keyword, "$while")) {
@@ -735,7 +742,7 @@ pub const ast = struct {
         raw_code: TextBlock,
         state_machine: StateMachine,
         sub_machine: StateMachine,
-        process: StateMachine,
+        procedure: StateMachine,
         suspender: Suspender,
     };
 
@@ -768,6 +775,7 @@ pub const ast = struct {
         call: CallLike,
         jump: CallLike,
         @"return": Return,
+        infinite_loop: InfiniteLoop,
         while_loop: WhileLoop,
         if_condition: IfCondition,
         @"break",
@@ -795,6 +803,10 @@ pub const ast = struct {
 
     pub const Return = struct {
         value: ?TextBlock,
+    };
+
+    pub const InfiniteLoop = struct {
+        body: Block,
     };
 
     pub const WhileLoop = struct {
@@ -849,7 +861,7 @@ pub const ast = struct {
                             });
                         },
 
-                        .process, .state_machine, .sub_machine => |sm| {
+                        .procedure, .state_machine, .sub_machine => |sm| {
                             try dmp.stream.print("{s} {s}({any}) {}\n", .{ @tagName(node), sm.name, sm.parameters, sm.return_type });
                             try dmp.block(sm.body, 0);
                         },
@@ -901,6 +913,10 @@ pub const ast = struct {
                         }
 
                         try dmp.stream.writeAll(";\n");
+                    },
+                    .infinite_loop => |cond| {
+                        try dmp.stream.writeAll("$loop\n");
+                        try dmp.block(cond.body, depth);
                     },
                     .while_loop => |cond| {
                         try dmp.stream.writeAll("$while_loop(");
@@ -1146,13 +1162,18 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
                 if (previous != null)
                     return error.DuplicateSuspender;
             },
-            .state_machine, .sub_machine, .process => |sm| {
+            .state_machine, .sub_machine, .procedure => |sm| {
                 const previous = try submachines.fetchPut(sm.name, .{
                     .name = sm.name,
                     .parameters = try CodeGen.transpose_param_list(arena.allocator(), sm.parameters),
                     .return_type = .global(sm.return_type),
                     .sm = sm,
-                    .is_top_level = (node != .process),
+                    .kind = switch (node) {
+                        .state_machine => .statemachine,
+                        .sub_machine => .submachine,
+                        .procedure => .procedure,
+                        .raw_code, .suspender => unreachable,
+                    },
                 });
                 if (previous != null)
                     return error.DuplicateStateMachine;
@@ -1168,7 +1189,7 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
                 continue;
             },
 
-            .suspender, .process, .sub_machine => continue,
+            .suspender, .procedure, .sub_machine => continue,
         };
 
         var cg: CodeGen = .{
@@ -1183,12 +1204,12 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
             .state_variables = .init(arena.allocator()),
         };
 
-        _ = try cg.generate(sm.*, true);
+        _ = try cg.generate(sm.*, .statemachine);
 
         // Generate all dependencies as well here:
         while (cg.required_machines.pop()) |kv| {
             const submachine = submachines.get(kv.key) orelse return error.MissingDependency;
-            _ = try cg.generate(submachine.sm, submachine.is_top_level);
+            _ = try cg.generate(submachine.sm, submachine.kind);
         }
         std.debug.assert(cg.required_machines.count() == 0);
         std.debug.assert(cg.emitted_machines.count() > 0);
@@ -1226,11 +1247,25 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
 
 const CodeGen = struct {
     pub const StateMachine = struct {
+        pub const Kind = enum {
+            statemachine,
+            submachine,
+            procedure,
+
+            fn is_top_level(kind: Kind) bool {
+                return switch (kind) {
+                    .procedure => false,
+                    .statemachine => true,
+                    .submachine => true,
+                };
+            }
+        };
+
         name: []const u8,
         parameters: []const ir.Parameter,
         return_type: ir.TextBlock,
         sm: ast.StateMachine,
-        is_top_level: bool,
+        kind: Kind,
     };
 
     const Label = struct {
@@ -1313,7 +1348,7 @@ const CodeGen = struct {
         try cg.required_machines.put(name, {});
     }
 
-    fn generate(cg: *CodeGen, sm: ast.StateMachine, is_toplevel: bool) !ir.Label {
+    fn generate(cg: *CodeGen, sm: ast.StateMachine, sm_kind: CodeGen.StateMachine.Kind) !ir.Label {
         try cg.emitted_machines.put(sm.name, {});
         _ = cg.required_machines.swapRemove(sm.name);
 
@@ -1322,8 +1357,12 @@ const CodeGen = struct {
 
         const ctx: BlockContext = .{
             .scope = sm.name,
-            .is_toplevel = is_toplevel,
+            .sm_kind = sm_kind,
         };
+
+        if (sm_kind == .procedure) {
+            try cg.add_state_var(try cg.get_state_name(sm.name, .return_value), .global(sm.return_type));
+        }
 
         for (sm.parameters) |param| {
             try cg.add_state_var(try cg.get_state_name(sm.name, .{ .parameter = param.name }), .global(param.type));
@@ -1336,7 +1375,7 @@ const CodeGen = struct {
         else
             null;
 
-        const last_is_branch = (last_instr == .stop or last_instr == .branch);
+        const last_is_branch = (last_instr == .stop or last_instr == .branch or last_instr == .ret);
 
         const any_jumps_to_end = for (cg.labels.items) |lbl| {
             if (lbl.offset == cg.instructions.items.len)
@@ -1371,7 +1410,7 @@ const CodeGen = struct {
 
         scope: []const u8,
         loop: ?Loop = null,
-        is_toplevel: bool,
+        sm_kind: StateMachine.Kind,
 
         pub fn local(ctx: BlockContext, block: ast.TextBlock) ir.TextBlock {
             return .local(block, ctx.scope);
@@ -1396,9 +1435,16 @@ const CodeGen = struct {
     fn add_state_var(cg: *CodeGen, name: []const u8, type_name: ir.TextBlock) !void {
         std.log.info("var {s}: {s}", .{ name, type_name });
         const gop = try cg.state_variables.getOrPut(name);
-        if (gop.found_existing)
+        if (gop.found_existing) {
+            try cg.emit_error("duplicate state {s}", .{name});
             return error.DuplicateState;
+        }
         gop.value_ptr.* = type_name;
+    }
+
+    fn emit_error(cg: *CodeGen, comptime fmt: []const u8, args: anytype) !void {
+        std.log.err(fmt, args);
+        _ = cg;
     }
 
     fn generate_stmt(cg: *CodeGen, stmt: ast.Statement, ctx: BlockContext) !void {
@@ -1406,18 +1452,29 @@ const CodeGen = struct {
             .raw_code => |code| try cg.emit(.{ .execute = ctx.local(code) }),
 
             .state_variable => |state| {
-                try cg.add_state_var(state.variable_name, .global(state.type_spec));
+                const state_name = try cg.get_state_name(ctx.scope, .{ .local = state.variable_name });
+
+                try cg.add_state_var(state_name, .global(state.type_spec));
                 try cg.emit(.{ .set_state = .{
-                    .variable = state.variable_name,
+                    .variable = state_name,
                     .value = ctx.local(state.initial_value),
                 } });
             },
 
             .yield => |yield| {
-                const suspender = cg.suspenders.get(yield.function_name) orelse return error.UnknownSuspender;
+                const suspender = cg.suspenders.get(yield.function_name) orelse {
+                    try cg.emit_error("Unknown suspender {s}", .{yield.function_name});
+                    return error.UnknownSuspender;
+                };
 
-                if (yield.arguments.len != suspender.parameters.len)
+                if (yield.arguments.len != suspender.parameters.len) {
+                    try cg.emit_error("parameter mismatch for suspender {s}: expecteed {} parameters, found {}", .{
+                        suspender.name,
+                        suspender.parameters.len,
+                        yield.arguments.len,
+                    });
                     return error.ParameterMismatch;
+                }
 
                 if (yield.output_to) |output_to| {
                     if (yield.as_state) {
@@ -1443,15 +1500,33 @@ const CodeGen = struct {
             },
 
             .call => |call| {
-                const submachine = cg.submachines.get(call.function_name) orelse return error.UnknownStateMachine;
-                if (submachine.parameters.len != call.arguments.len)
+                const submachine = cg.submachines.get(call.function_name) orelse {
+                    try cg.emit_error("Unknown procedure {s}", .{call.function_name});
+                    return error.UnknownStateMachine;
+                };
+                if (submachine.parameters.len != call.arguments.len) {
+                    try cg.emit_error("parameter mismatch for procedure {s}: expecteed {} parameters, found {}", .{
+                        submachine.name,
+                        submachine.parameters.len,
+                        call.arguments.len,
+                    });
                     return error.ParameterMismatch;
+                }
 
                 for (submachine.parameters, call.arguments) |param, arg| {
                     try cg.emit(.{ .set_state = .{
                         .variable = try cg.get_state_name(submachine.name, .{ .parameter = param.name }),
                         .value = ctx.local(arg),
                     } });
+                }
+
+                if (call.output_to) |output_to| {
+                    if (call.as_state) {
+                        try cg.add_state_var(
+                            try cg.get_state_name(ctx.scope, .{ .local = output_to.text }),
+                            submachine.return_type,
+                        );
+                    }
                 }
 
                 const target = try cg.get_tagged_label(call.function_name);
@@ -1469,9 +1544,18 @@ const CodeGen = struct {
                 if (jmp.with_try or jmp.as_state)
                     return error.SyntaxError;
 
-                const submachine = cg.submachines.get(jmp.function_name) orelse return error.UnknownStateMachine;
-                if (submachine.parameters.len != jmp.arguments.len)
+                const submachine = cg.submachines.get(jmp.function_name) orelse {
+                    try cg.emit_error("Unknown statemachine {s}", .{jmp.function_name});
+                    return error.UnknownStateMachine;
+                };
+                if (submachine.parameters.len != jmp.arguments.len) {
+                    try cg.emit_error("parameter mismatch for submachine {s}: expecteed {} parameters, found {}", .{
+                        submachine.name,
+                        submachine.parameters.len,
+                        jmp.arguments.len,
+                    });
                     return error.ParameterMismatch;
+                }
 
                 for (submachine.parameters, jmp.arguments) |param, arg| {
                     try cg.emit(.{ .set_state = .{
@@ -1490,8 +1574,9 @@ const CodeGen = struct {
             },
 
             .@"return" => |ret| {
-                if (ctx.is_toplevel) {
+                if (ctx.sm_kind.is_top_level()) {
                     if (ret.value != null) {
+                        try cg.emit_error("Cannot return a value from statemachine or submachine", .{});
                         return error.ValueReturnOnToplevel;
                     }
                     try cg.emit(.stop);
@@ -1508,6 +1593,26 @@ const CodeGen = struct {
                 }
             },
 
+            .infinite_loop => |loop| {
+                const loop_start = try cg.create_label(.here);
+                const loop_end = try cg.create_label(.undefined);
+                loop_start.used = true;
+
+                try cg.generate_block(loop.body, .{
+                    .scope = ctx.scope,
+                    .sm_kind = ctx.sm_kind,
+                    .loop = .{
+                        .cont_point = loop_start,
+                        .break_point = loop_end,
+                    },
+                });
+                try cg.emit(.{
+                    .branch = .{ .target = loop_start.id },
+                });
+
+                try cg.define_label(loop_end);
+            },
+
             .while_loop => |loop| {
                 const loop_start = try cg.create_label(.here);
                 const loop_end = try cg.create_label(.undefined);
@@ -1522,7 +1627,7 @@ const CodeGen = struct {
                 });
                 try cg.generate_block(loop.body, .{
                     .scope = ctx.scope,
-                    .is_toplevel = ctx.is_toplevel,
+                    .sm_kind = ctx.sm_kind,
                     .loop = .{
                         .cont_point = loop_start,
                         .break_point = loop_end,
@@ -1552,14 +1657,20 @@ const CodeGen = struct {
             },
 
             .@"break" => {
-                const loop = ctx.loop orelse return error.BreakOutsideLoop;
+                const loop = ctx.loop orelse {
+                    try cg.emit_error("Cannot use $break outside of a loop.", .{});
+                    return error.BreakOutsideLoop;
+                };
                 loop.break_point.used = true;
                 try cg.emit(.{
                     .branch = .{ .target = loop.break_point.id },
                 });
             },
             .@"continue" => {
-                const loop = ctx.loop orelse return error.BreakOutsideLoop;
+                const loop = ctx.loop orelse {
+                    try cg.emit_error("Cannot use $continue outside of a loop.", .{});
+                    return error.BreakOutsideLoop;
+                };
                 loop.cont_point.used = true;
                 try cg.emit(.{
                     .branch = .{ .target = loop.cont_point.id },
@@ -1816,7 +1927,11 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     return .switches_state;
                 },
                 .execute => |code| {
+                    // Adds a small "safety wrapper" around the execution blocks,
+                    // and also makes the ASTgen happy
+                    try ren.writeAll("    if(true) {\n");
                     try ren.print("      {s}\n", .{ren.fmt_code(code)});
+                    try ren.writeAll("    }\n");
                     return .default;
                 },
                 .branch => |branch| {

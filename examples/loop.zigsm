@@ -1,0 +1,20 @@
+const std = @import("std");
+
+$suspender write_byte(data: u8) void;
+$suspender read_byte() u8;
+
+$statemachine Loop() void {
+    $loop {
+        $yield write_byte(0);
+    }
+}
+
+test Loop {
+    const SM = Loop;
+
+    var sm: SM = .{};
+    try std.testing.expectEqual(SM.Result{ .write_byte = .{0}}, try sm.step(.launch));
+    try std.testing.expectEqual(SM.Result{ .write_byte = .{0}}, try sm.step(.write_byte));
+    try std.testing.expectEqual(SM.Result{ .write_byte = .{0}}, try sm.step(.write_byte));
+    try std.testing.expectEqual(SM.Result{ .write_byte = .{0}}, try sm.step(.write_byte));
+}
