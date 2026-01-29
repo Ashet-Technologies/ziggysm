@@ -16,6 +16,7 @@ pub fn main() !u8 {
     defer arena.deinit();
 
     const allocator = arena.allocator();
+    const stdout = std.fs.File.stdout().deprecatedWriter();
 
     var cli = args_parser.parseForCurrentProcess(CliArgs, allocator, .print) catch return 1;
     defer cli.deinit();
@@ -32,35 +33,35 @@ pub fn main() !u8 {
     var document = try parse(allocator, script);
     defer document.deinit();
 
-    try ast.dump(document, std.io.getStdOut().writer());
+    try ast.dump(document, stdout);
 
     var program = try generate_code(allocator, document);
     defer program.deinit();
     {
-        const writer = std.io.getStdOut().writer();
+        const writer = stdout;
         for (program.structure) |node| {
             switch (node) {
                 .state_machine => |sm| {
                     try writer.print("StateMachine {s}:\n", .{sm.name});
                     try ir.dump(sm, writer);
                 },
-                .top_level_code => |code| try writer.print("TopLevel Code: {}\n", .{code}),
+                .top_level_code => |code| try writer.print("TopLevel Code: {f}\n", .{code}),
             }
         }
     }
 
     const unformatted_code = blk: {
-        var sink: std.ArrayList(u8) = .init(allocator);
-        defer sink.deinit();
+        var sink: std.ArrayList(u8) = .empty;
+        defer sink.deinit(allocator);
 
         for (program.structure) |node| {
             switch (node) {
-                .state_machine => |sm| try render(allocator, program, sm, sink.writer()),
-                .top_level_code => |code| try sink.appendSlice(code.text), // no processing of global replacements
+                .state_machine => |sm| try render(allocator, program, sm, sink.writer(allocator)),
+                .top_level_code => |code| try sink.appendSlice(allocator, code.text), // no processing of global replacements
             }
         }
 
-        break :blk try sink.toOwnedSliceSentinel(0);
+        break :blk try sink.toOwnedSliceSentinel(allocator, 0);
     };
 
     const formatted_code = blk: {
@@ -68,7 +69,7 @@ pub fn main() !u8 {
         if (zig_ast.errors.len > 0)
             break :blk unformatted_code;
 
-        break :blk try zig_ast.render(allocator);
+        break :blk try zig_ast.renderAlloc(allocator);
     };
 
     if (cli.options.output.len > 0) {
@@ -77,7 +78,7 @@ pub fn main() !u8 {
             .data = formatted_code,
         });
     } else {
-        try std.io.getStdOut().writeAll(formatted_code);
+        try stdout.writeAll(formatted_code);
     }
 
     return 0;
@@ -118,7 +119,7 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) !ast.Document {
             }
         }
 
-        std.log.err("{}:{}: error.{s} at {}", .{
+        std.log.err("{}:{}: error.{s} at {f}", .{
             line,
             col,
             @errorName(err),
@@ -135,16 +136,16 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) !ast.Document {
         .allocator = arena.allocator(),
     };
 
-    var list: std.ArrayList(ast.TopLevelNode) = .init(parser.allocator);
-    defer list.deinit();
+    var list: std.ArrayList(ast.TopLevelNode) = .empty;
+    defer list.deinit(parser.allocator);
 
     while (try parser.accept_top_level_node()) |tln| {
         if (tln == .raw_code and tln.raw_code.text.len == 0)
             continue;
-        try list.append(tln);
+        try list.append(parser.allocator, tln);
     }
 
-    const top_level_nodes = try list.toOwnedSlice();
+    const top_level_nodes = try list.toOwnedSlice(parser.allocator);
     errdefer arena.allocator().free(top_level_nodes);
 
     return .{
@@ -226,8 +227,8 @@ pub const Parser = struct {
     }
 
     fn accept_block(parser: *Parser) error{ OutOfMemory, SyntaxError }!ast.Block {
-        var statements: std.ArrayList(ast.Statement) = .init(parser.allocator);
-        defer statements.deinit();
+        var statements: std.ArrayList(ast.Statement) = .empty;
+        defer statements.deinit(parser.allocator);
 
         const tok = parser.tokenizer;
 
@@ -247,13 +248,13 @@ pub const Parser = struct {
             if (stmt == .raw_code and stmt.raw_code.text.len == 0) {
                 continue;
             }
-            try statements.append(stmt);
+            try statements.append(parser.allocator, stmt);
         }
 
         std.debug.assert(tok.data[tok.pos - 1] == '}');
 
         return .{
-            .statements = try statements.toOwnedSlice(),
+            .statements = try statements.toOwnedSlice(parser.allocator),
         };
     }
 
@@ -423,8 +424,8 @@ pub const Parser = struct {
 
         try parser.accept_literal("(");
 
-        var list: std.ArrayList(ast.Parameter) = .init(parser.allocator);
-        defer list.deinit();
+        var list: std.ArrayList(ast.Parameter) = .empty;
+        defer list.deinit(parser.allocator);
 
         while (true) {
             tokenizer.skip_space();
@@ -444,7 +445,7 @@ pub const Parser = struct {
                 .include_stop_char = false,
             });
 
-            try list.append(.{
+            try list.append(parser.allocator, .{
                 .name = name,
                 .type = .{ .text = type_name },
             });
@@ -455,7 +456,7 @@ pub const Parser = struct {
 
         try parser.accept_literal(")");
 
-        return try list.toOwnedSlice();
+        return try list.toOwnedSlice(parser.allocator);
     }
 
     pub fn next_parens_list(parser: *Parser) ![]ast.TextBlock {
@@ -463,8 +464,8 @@ pub const Parser = struct {
 
         try parser.accept_literal("(");
 
-        var list: std.ArrayList(ast.TextBlock) = .init(parser.allocator);
-        defer list.deinit();
+        var list: std.ArrayList(ast.TextBlock) = .empty;
+        defer list.deinit(parser.allocator);
 
         while (true) {
             tokenizer.skip_space();
@@ -477,7 +478,7 @@ pub const Parser = struct {
             });
 
             if (group.len != 0) {
-                try list.append(.{ .text = group });
+                try list.append(parser.allocator, .{ .text = group });
             }
 
             if (!parser.try_accept_literal(","))
@@ -486,7 +487,7 @@ pub const Parser = struct {
 
         try parser.accept_literal(")");
 
-        return try list.toOwnedSlice();
+        return try list.toOwnedSlice(parser.allocator);
     }
 
     pub fn next_parens_group(parser: *Parser) !ast.TextBlock {
@@ -822,21 +823,18 @@ pub const ast = struct {
     pub const TextBlock = struct {
         text: []const u8,
 
-        pub fn format(tb: TextBlock, fmt: []const u8, opt: std.fmt.FormatOptions, writer: anytype) !void {
+        pub fn format(tb: TextBlock, writer: *std.io.Writer) std.io.Writer.Error!void {
             const max_len = 32;
             const split_len = @divExact(max_len, 2);
-            _ = fmt;
-            _ = opt;
             try writer.writeAll("TextBlock('");
             if (tb.text.len < max_len) {
-                try writer.print("{'}", .{std.zig.fmtEscapes(tb.text)});
+                try std.zig.stringEscape(tb.text, writer);
             } else {
                 const head = tb.text[0..split_len];
                 const tail = tb.text[tb.text.len - split_len ..];
-                try writer.print("{'}…{'}", .{
-                    std.zig.fmtEscapes(head),
-                    std.zig.fmtEscapes(tail),
-                });
+                try std.zig.stringEscape(head, writer);
+                try writer.writeAll("…");
+                try std.zig.stringEscape(tail, writer);
             }
             try writer.writeAll("')");
         }
@@ -851,10 +849,10 @@ pub const ast = struct {
             fn render(dmp: Dumper, d: Document) !void {
                 for (d.top_level_nodes) |node| {
                     switch (node) {
-                        .raw_code => |code| try dmp.stream.print("{}\n", .{code}),
+                        .raw_code => |code| try dmp.stream.print("{f}\n", .{code}),
 
                         .suspender => |func| {
-                            try dmp.stream.print("suspender {s}({any}) {}\n", .{
+                            try dmp.stream.print("suspender {s}({any}) {f}\n", .{
                                 func.name,
                                 func.parameters,
                                 func.return_type,
@@ -862,7 +860,7 @@ pub const ast = struct {
                         },
 
                         .procedure, .state_machine, .sub_machine => |sm| {
-                            try dmp.stream.print("{s} {s}({any}) {}\n", .{ @tagName(node), sm.name, sm.parameters, sm.return_type });
+                            try dmp.stream.print("{s} {s}({any}) {f}\n", .{ @tagName(node), sm.name, sm.parameters, sm.return_type });
                             try dmp.block(sm.body, 0);
                         },
                     }
@@ -883,9 +881,9 @@ pub const ast = struct {
 
                 try dmp.stream.writeAll(prefix);
                 switch (stmt) {
-                    .raw_code => |code| try dmp.stream.print("{}\n", .{code}),
+                    .raw_code => |code| try dmp.stream.print("{f}\n", .{code}),
                     .state_variable => |state| {
-                        try dmp.stream.print("$state {s}: {} = {};\n", .{
+                        try dmp.stream.print("$state {s}: {f} = {f};\n", .{
                             state.variable_name,
                             state.type_spec,
                             state.initial_value,
@@ -899,7 +897,7 @@ pub const ast = struct {
                             call.arguments,
                         });
                         if (call.output_to) |output| {
-                            try dmp.stream.print("-> {s}{}", .{
+                            try dmp.stream.print("-> {s}{f}", .{
                                 if (call.with_try) " $state" else "",
                                 output,
                             });
@@ -909,7 +907,7 @@ pub const ast = struct {
                     .@"return" => |ret| {
                         try dmp.stream.writeAll("$return");
                         if (ret.value) |value| {
-                            try dmp.stream.print(" {}", .{value});
+                            try dmp.stream.print(" {f}", .{value});
                         }
 
                         try dmp.stream.writeAll(";\n");
@@ -920,13 +918,13 @@ pub const ast = struct {
                     },
                     .while_loop => |cond| {
                         try dmp.stream.writeAll("$while_loop(");
-                        try dmp.stream.print("{}", .{cond.condition});
+                        try dmp.stream.print("{f}", .{cond.condition});
                         try dmp.stream.writeAll(")\n");
                         try dmp.block(cond.body, depth);
                     },
                     .if_condition => |cond| {
                         try dmp.stream.writeAll("$if_condition(");
-                        try dmp.stream.print("{}", .{cond.condition});
+                        try dmp.stream.print("{f}", .{cond.condition});
                         try dmp.stream.writeAll(")\n");
                         try dmp.block(cond.true_body, depth);
                     },
@@ -958,26 +956,29 @@ const ir = struct {
             return .{ .text = tb.text, .scope = scope };
         }
 
-        pub fn format(tb: TextBlock, fmt: []const u8, opt: std.fmt.FormatOptions, writer: anytype) !void {
+        pub fn format(tb: TextBlock, writer: *std.io.Writer) std.io.Writer.Error!void {
             const max_len = 32;
             const split_len = @divExact(max_len, 2);
-            _ = fmt;
-            _ = opt;
             try writer.writeAll("TextBlock(");
             if (tb.scope) |scope| {
-                try writer.print("'{'}', ", .{std.zig.fmtEscapes(scope)});
+                try writer.writeAll("'");
+                try std.zig.stringEscape(scope, writer);
+                try writer.writeAll("', ");
             } else {
                 try writer.writeAll("null, ");
             }
             if (tb.text.len < max_len) {
-                try writer.print("'{'}", .{std.zig.fmtEscapes(tb.text)});
+                try writer.writeAll("'");
+                try std.zig.stringEscape(tb.text, writer);
+                try writer.writeAll("'");
             } else {
                 const head = tb.text[0..split_len];
                 const tail = tb.text[tb.text.len - split_len ..];
-                try writer.print("'{'}…{'}", .{
-                    std.zig.fmtEscapes(head),
-                    std.zig.fmtEscapes(tail),
-                });
+                try writer.writeAll("'");
+                try std.zig.stringEscape(head, writer);
+                try writer.writeAll("…");
+                try std.zig.stringEscape(tail, writer);
+                try writer.writeAll("'");
             }
             try writer.writeAll("')");
         }
@@ -987,10 +988,7 @@ const ir = struct {
         undefined = std.math.maxInt(usize),
         _,
 
-        pub fn format(lbl: Label, fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-            _ = fmt;
-            _ = options;
-
+        pub fn format(lbl: Label, writer: *std.io.Writer) std.io.Writer.Error!void {
             try writer.print("lbl{}", .{@intFromEnum(lbl)});
         }
     };
@@ -1095,9 +1093,7 @@ const ir = struct {
             for (pgm.labels.keys(), pgm.labels.values()) |lbl, data| {
                 if (data.offset != offset)
                     continue;
-                try writer.print("        {}:\n", .{
-                    lbl,
-                });
+                try writer.print("        {f}:\n", .{lbl});
             }
             try writer.print("0x{X:0>4}    ", .{
                 offset,
@@ -1105,10 +1101,10 @@ const ir = struct {
             switch (instr) {
                 .stop => try writer.writeAll("STOP"),
                 .execute => |code| {
-                    try writer.print("EXEC  {}", .{code});
+                    try writer.print("EXEC  {f}", .{code});
                 },
                 .yield => |yield| {
-                    try writer.print("YIELD {s}, {any}, {s}{?}", .{
+                    try writer.print("YIELD {s}, {any}, {s}{?f}", .{
                         yield.function,
                         yield.arguments,
                         if (yield.use_try) "try " else "",
@@ -1116,22 +1112,22 @@ const ir = struct {
                     });
                 },
                 .set_state => |state| {
-                    try writer.print("SETST {s}, {}", .{ state.variable, state.value });
+                    try writer.print("SETST {s}, {f}", .{ state.variable, state.value });
                 },
                 .branch => |branch| {
-                    try writer.print("BR    {}", .{branch.target});
+                    try writer.print("BR    {f}", .{branch.target});
                 },
                 .call => |branch| {
-                    try writer.print("CALL  {s}, {s}", .{ branch.target, branch.dest_variable });
+                    try writer.print("CALL  {f}, {s}", .{ branch.target, branch.dest_variable });
                 },
                 .ret => |branch| {
                     try writer.print("RET   {s}", .{branch.dest_variable});
                 },
                 .true_branch => |branch| {
-                    try writer.print("BR.T  {}, {}", .{ branch.target, branch.condition });
+                    try writer.print("BR.T  {f}, {f}", .{ branch.target, branch.condition });
                 },
                 .false_branch => |branch| {
-                    try writer.print("BR.F  {}, {}", .{ branch.target, branch.condition });
+                    try writer.print("BR.F  {f}, {f}", .{ branch.target, branch.condition });
                 },
             }
             try writer.writeAll("\n");
@@ -1143,7 +1139,7 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
     var arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer arena.deinit();
 
-    var structure: std.ArrayList(ir.Node) = .init(arena.allocator());
+    var structure: std.ArrayList(ir.Node) = .empty;
 
     var suspenders: std.StringArrayHashMap(ir.Suspender) = .init(arena.allocator());
     var submachines: std.StringArrayHashMap(CodeGen.StateMachine) = .init(arena.allocator());
@@ -1185,7 +1181,7 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
         const sm = switch (node) {
             .state_machine => |*sm| sm,
             .raw_code => |code| {
-                try structure.append(.{ .top_level_code = .global(code) });
+                try structure.append(arena.allocator(), .{ .top_level_code = .global(code) });
                 continue;
             },
 
@@ -1194,8 +1190,8 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
 
         var cg: CodeGen = .{
             .allocator = arena.allocator(),
-            .instructions = .init(arena.allocator()),
-            .labels = .init(arena.allocator()),
+            .instructions = .empty,
+            .labels = .empty,
             .tagged_labels = .init(arena.allocator()),
             .suspenders = &suspenders,
             .submachines = &submachines,
@@ -1214,7 +1210,7 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
         std.debug.assert(cg.required_machines.count() == 0);
         std.debug.assert(cg.emitted_machines.count() > 0);
 
-        const instructions = try cg.instructions.toOwnedSlice();
+        const instructions = try cg.instructions.toOwnedSlice(cg.allocator);
         errdefer cg.allocator.free(instructions);
 
         var labels: std.AutoArrayHashMap(ir.Label, ir.LabelData) = .init(arena.allocator());
@@ -1235,12 +1231,12 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
             .states = cg.state_variables,
         };
 
-        try structure.append(.{ .state_machine = generated_sm });
+        try structure.append(arena.allocator(), .{ .state_machine = generated_sm });
     }
 
     return .{
         .arena = arena,
-        .structure = try structure.toOwnedSlice(),
+        .structure = try structure.toOwnedSlice(arena.allocator()),
         .suspenders = suspenders,
     };
 }
@@ -1319,7 +1315,7 @@ const CodeGen = struct {
                 .undefined => null,
             },
         };
-        try cg.labels.append(lbl);
+        try cg.labels.append(cg.allocator, lbl);
 
         return lbl;
     }
@@ -1433,7 +1429,7 @@ const CodeGen = struct {
     }
 
     fn add_state_var(cg: *CodeGen, name: []const u8, type_name: ir.TextBlock) !void {
-        std.log.info("var {s}: {s}", .{ name, type_name });
+        std.log.info("var {s}: {f}", .{ name, type_name });
         const gop = try cg.state_variables.getOrPut(name);
         if (gop.found_existing) {
             try cg.emit_error("duplicate state {s}", .{name});
@@ -1698,7 +1694,7 @@ const CodeGen = struct {
     }
 
     fn emit(cg: *CodeGen, instr: ir.Instruction) !void {
-        try cg.instructions.append(instr);
+        try cg.instructions.append(cg.allocator, instr);
     }
 };
 
@@ -1730,10 +1726,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                 return mask.type;
             }
 
-            pub fn format(state: State, fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-                _ = fmt;
-                _ = options;
-
+            pub fn format(state: State, writer: *std.io.Writer) std.io.Writer.Error!void {
                 switch (state) {
                     .initial => try writer.writeAll("initial"),
                     .stopped => try writer.writeAll("stopped"),
@@ -1794,13 +1787,13 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
 
         fn run(ren: *Renderer) !void {
             try ren.writeAll("\n\n");
-            try ren.print("pub const {} = struct {{\n", .{fmt_id(ren.sm.name)});
+            try ren.print("pub const {f} = struct {{\n", .{fmt_id(ren.sm.name)});
 
             try ren.writeAll("  state: State = .initial,\n");
             try ren.writeAll("  branches: BranchSet = .{},\n");
             try ren.writeAll("  data: Data = .{},\n");
 
-            try ren.print("  pub fn step(sm: *{}, resume_val: ReturnValue) !Result {{\n", .{fmt_id(ren.sm.name)});
+            try ren.print("  pub fn step(sm: *{f}, resume_val: ReturnValue) !Result {{\n", .{fmt_id(ren.sm.name)});
 
             try ren.writeAll("    __sm__: switch(sm.state) {\n");
 
@@ -1845,13 +1838,13 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
 
             try ren.writeAll("  const State = enum {\n");
             for (ren.states.keys()) |state| {
-                try ren.print("    {},\n", .{state});
+                try ren.print("    {f},\n", .{state});
             }
             try ren.writeAll("  };\n\n");
             try ren.writeAll("  const BranchSet = struct {\n");
 
             for (ren.required_dynbranch.keys()) |branch| {
-                try ren.print("{}: ?State = null,\n", .{fmt_id(branch)});
+                try ren.print("{f}: ?State = null,\n", .{fmt_id(branch)});
             }
 
             try ren.writeAll("  };\n\n");
@@ -1868,7 +1861,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                 else
                     raw_state_type;
 
-                try ren.print("{}: {} = undefined,\n", .{ // TODO: Implement proper state types here!
+                try ren.print("{f}: {f} = undefined,\n", .{ // TODO: Implement proper state types here!
                     fmt_id(state_name),
                     fmt_raw(state_type),
                 });
@@ -1880,7 +1873,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             for (ren.required_suspenders.keys()) |suspender_id| {
                 const suspender = ren.program.suspenders.get(suspender_id).?;
 
-                try ren.print("      {}: {},\n", .{
+                try ren.print("      {f}: {f},\n", .{
                     fmt_id(suspender_id),
                     fmt_raw(suspender.return_type),
                 });
@@ -1891,13 +1884,13 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             for (ren.required_suspenders.keys()) |suspender_id| {
                 const suspender = ren.program.suspenders.get(suspender_id).?;
 
-                try ren.print("      {}: struct{{", .{
+                try ren.print("      {f}: struct{{", .{
                     fmt_id(suspender_id),
                 });
                 for (suspender.parameters, 0..) |param, index| {
                     if (index > 0)
                         try ren.writeAll(", ");
-                    try ren.print("{}", .{fmt_raw(param.type)});
+                    try ren.print("{f}", .{fmt_raw(param.type)});
                 }
                 try ren.writeAll("},\n");
             }
@@ -1930,7 +1923,9 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     // Adds a small "safety wrapper" around the execution blocks,
                     // and also makes the ASTgen happy
                     try ren.writeAll("    if(true) {\n");
-                    try ren.print("      {s}\n", .{ren.fmt_code(code)});
+                    try ren.writeAll("      ");
+                    try ren.write_code(code);
+                    try ren.writeAll("\n");
                     try ren.writeAll("    }\n");
                     return .default;
                 },
@@ -1939,10 +1934,9 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     return .switches_state;
                 },
                 .true_branch, .false_branch => |branch| {
-                    try ren.print("      if(({s}) == {}) {{\n", .{
-                        ren.fmt_code(branch.condition),
-                        (instr == .true_branch),
-                    });
+                    try ren.writeAll("      if((");
+                    try ren.write_code(branch.condition);
+                    try ren.print(") == {}) {{\n", .{(instr == .true_branch)});
                     try ren.write_state_switch(ren.state_from_label(branch.target));
                     try ren.writeAll("      }\n");
                     return .default;
@@ -1952,12 +1946,12 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     const hopstate = try ren.alloc_state(.branch);
 
                     try ren.required_dynbranch.put(call.dest_variable, {});
-                    try ren.print("      if(sm.branches.{} != null) @panic(\"A recursive CALL to {} was detected at runtime.\");\n", .{
+                    try ren.print("      if(sm.branches.{f} != null) @panic(\"A recursive CALL to {f} was detected at runtime.\");\n", .{
                         fmt_id(call.dest_variable),
-                        std.zig.fmtEscapes(call.dest_variable),
+                        std.zig.fmtString(call.dest_variable),
                     });
 
-                    try ren.print("      sm.branches.{} = .{};\n", .{ fmt_id(call.dest_variable), hopstate });
+                    try ren.print("      sm.branches.{f} = .{f};\n", .{ fmt_id(call.dest_variable), hopstate });
 
                     const target_state = ren.state_from_label(call.target);
                     try ren.write_state_switch(target_state);
@@ -1971,12 +1965,12 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     try ren.required_dynbranch.put(ret.dest_variable, {});
 
                     // 1. Fetch the return state
-                    try ren.print("      sm.state = sm.branches.{} orelse @panic(\"RET was reached without a previous CALL for proc {}\");\n", .{
+                    try ren.print("      sm.state = sm.branches.{f} orelse @panic(\"RET was reached without a previous CALL for proc {f}\");\n", .{
                         fmt_id(ret.dest_variable),
-                        std.zig.fmtEscapes(ret.dest_variable),
+                        std.zig.fmtString(ret.dest_variable),
                     });
                     // 2. Reset the state such that another RET would panic
-                    try ren.print("      sm.branches.{} = null;\n", .{fmt_id(ret.dest_variable)});
+                    try ren.print("      sm.branches.{f} = null;\n", .{fmt_id(ret.dest_variable)});
                     // 3. Perform the actual branch to the return location
                     try ren.print("      continue :__sm__ sm.state;\n", .{});
 
@@ -1988,24 +1982,26 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
 
                     const hopstate = try ren.alloc_state(.yield);
 
-                    try ren.print("      sm.state = .{s};\n", .{hopstate});
-                    try ren.print("      return .{{ .{} = .{{ ", .{
+                    try ren.print("      sm.state = .{f};\n", .{hopstate});
+                    try ren.print("      return .{{ .{f} = .{{ ", .{
                         fmt_id(yield.function),
                     });
                     for (yield.arguments, 0..) |arg, i| {
                         if (i > 0) {
                             try ren.writeAll(", ");
                         }
-                        try ren.print("({s})", .{ren.fmt_code(arg)});
+                        try ren.writeAll("(");
+                        try ren.write_code(arg);
+                        try ren.writeAll(")");
                     }
                     try ren.writeAll(" } };\n");
                     try ren.write_new_state(hopstate, false);
-                    try ren.print("    if(resume_val != .{[0]})\n      @panic(\"BUG: State machine must be resumed with .{[0]}\");\n", .{
+                    try ren.print("    if(resume_val != .{[0]f})\n      @panic(\"BUG: State machine must be resumed with .{[0]f}\");\n", .{
                         fmt_id(yield.function),
                     });
 
                     if (yield.output) |output_target| {
-                        try ren.print("{s}", .{ren.fmt_code(output_target)});
+                        try ren.write_code(output_target);
                     } else {
                         // Discard the value so we catch the problem when we're silenty ignoring an error:
                         try ren.writeAll("_");
@@ -2014,25 +2010,24 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     if (yield.use_try) {
                         try ren.writeAll("try ");
                     }
-                    try ren.print("resume_val.{};\n", .{fmt_id(yield.function)});
+                    try ren.print("resume_val.{f};\n", .{fmt_id(yield.function)});
 
                     return .default;
                 },
 
                 .set_state => |state| {
                     try ren.required_states.put(state.variable, {});
-                    try ren.print("sm.data.{} = ({});\n", .{
-                        fmt_id(state.variable),
-                        ren.fmt_code(state.value),
-                    });
+                    try ren.print("sm.data.{f} = (", .{fmt_id(state.variable)});
+                    try ren.write_code(state.value);
+                    try ren.writeAll(");\n");
                     return .default;
                 },
             }
         }
 
         fn write_state_switch(ren: *Renderer, state: State) !void {
-            try ren.print("      sm.state = .{};\n", .{state});
-            try ren.print("      continue :__sm__ .{};\n", .{state});
+            try ren.print("      sm.state = .{f};\n", .{state});
+            try ren.print("      continue :__sm__ .{f};\n", .{state});
         }
 
         fn write_new_state(ren: *Renderer, new_state: State, include_autobranch: bool) !void {
@@ -2043,7 +2038,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                 }
                 try ren.writeAll("    },\n");
             }
-            try ren.print("    .{} => {{", .{new_state});
+            try ren.print("    .{f} => {{", .{new_state});
 
             // render the associated labels for each state:
             {
@@ -2059,7 +2054,7 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     }
 
                     any_label = true;
-                    try ren.print("{}", .{key});
+                    try ren.print("{f}", .{key});
                 }
             }
 
@@ -2067,34 +2062,23 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
             ren.current_state = new_state;
         }
 
-        fn fmt_raw(code: ir.TextBlock) std.fmt.Formatter(format_raw) {
+        fn fmt_raw(code: ir.TextBlock) std.fmt.Formatter(ir.TextBlock, format_raw) {
             return .{ .data = code };
         }
 
-        fn format_raw(code: ir.TextBlock, fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-            _ = fmt;
-            _ = options;
+        fn format_raw(code: ir.TextBlock, writer: *std.io.Writer) std.io.Writer.Error!void {
             try writer.writeAll(code.text);
         }
 
-        fn fmt_code(ren: *Renderer, code: ir.TextBlock) std.fmt.Formatter(format_code) {
-            return .{ .data = .{ ren, code } };
-        }
-
-        fn format_code(args: struct { *Renderer, ir.TextBlock }, fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-            const ren: *Renderer, const code: ir.TextBlock = args;
-
-            _ = fmt;
-            _ = options;
-
+        fn write_code(ren: *Renderer, code: ir.TextBlock) !void {
             const text = code.text;
 
             var pos: usize = 0;
             while (std.mem.indexOfPos(u8, text, pos, "${")) |index| {
-                try writer.writeAll(text[pos..index]);
+                try ren.writer.writeAll(text[pos..index]);
 
                 const end = std.mem.indexOfScalarPos(u8, text, index + 2, '}') orelse {
-                    try writer.writeAll("${");
+                    try ren.writer.writeAll("${");
                     pos += 2;
                     continue;
                 };
@@ -2106,17 +2090,16 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     local_name,
                 });
 
-                // try ren.required_states.put(name, {});
                 try ren.required_states.put(global_name, {});
 
-                try writer.print("sm.data.{}", .{
+                try ren.writer.print("sm.data.{f}", .{
                     fmt_id(global_name),
                 });
 
                 pos = end + 1;
             }
 
-            try writer.writeAll(text[pos..]);
+            try ren.writer.writeAll(text[pos..]);
         }
 
         fn writeAll(ren: *Renderer, str: []const u8) !void {

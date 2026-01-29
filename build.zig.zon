@@ -2,12 +2,12 @@
     .name = .ziggysm,
     .version = "0.0.0",
     .fingerprint = 0x1b5d0e61cb50fb6b, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.14.1",
+    .minimum_zig_version = "0.15.2",
 
     .dependencies = .{
         .args = .{
             .url = "git+https://github.com/ikskuh/zig-args.git#9425b94c103a031777fdd272c555ce93a7dea581",
-            .hash = "args-0.0.0-CiLiqv_NAAC97fGpk9hS2K681jkiqPsWP6w3ucb_ctGH",
+            .hash = "args-0.0.0-CiLiqo_RAADz2TiHUzG5-0Mk7IZHR-h1SZgUrb_k4c7d",
         },
     },
 
