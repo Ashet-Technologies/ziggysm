@@ -1438,6 +1438,48 @@ const CodeGen = struct {
         gop.value_ptr.* = type_name;
     }
 
+    fn error_union_payload(type_name: ir.TextBlock) ?ir.TextBlock {
+        const text = type_name.text;
+        var paren_depth: usize = 0;
+        var brace_depth: usize = 0;
+        var bracket_depth: usize = 0;
+
+        for (text, 0..) |ch, idx| {
+            switch (ch) {
+                '(' => paren_depth += 1,
+                ')' => {
+                    if (paren_depth > 0) {
+                        paren_depth -= 1;
+                    }
+                },
+                '{' => brace_depth += 1,
+                '}' => {
+                    if (brace_depth > 0) {
+                        brace_depth -= 1;
+                    }
+                },
+                '[' => bracket_depth += 1,
+                ']' => {
+                    if (bracket_depth > 0) {
+                        bracket_depth -= 1;
+                    }
+                },
+                '!' => {
+                    if (paren_depth == 0 and brace_depth == 0 and bracket_depth == 0) {
+                        const payload = std.mem.trim(u8, text[idx + 1 ..], " \t\n\r");
+                        if (payload.len == 0) {
+                            return null;
+                        }
+                        return .{ .text = payload, .scope = type_name.scope };
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return null;
+    }
+
     fn emit_error(cg: *CodeGen, comptime fmt: []const u8, args: anytype) !void {
         std.log.err(fmt, args);
         _ = cg;
@@ -1474,9 +1516,13 @@ const CodeGen = struct {
 
                 if (yield.output_to) |output_to| {
                     if (yield.as_state) {
+                        const state_type = if (yield.with_try)
+                            error_union_payload(suspender.return_type) orelse suspender.return_type
+                        else
+                            suspender.return_type;
                         try cg.add_state_var(
                             try cg.get_state_name(ctx.scope, .{ .local = output_to.text }),
-                            suspender.return_type,
+                            state_type,
                         );
                     }
                 }
@@ -1856,14 +1902,9 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     @panic("used undeclared state");
                 };
 
-                const state_type: ir.TextBlock = if (std.mem.indexOfScalar(u8, raw_state_type.text, '!')) |index|
-                    .{ .text = raw_state_type.text[index + 1 ..], .scope = null }
-                else
-                    raw_state_type;
-
-                try ren.print("{f}: {f} = undefined,\n", .{ // TODO: Implement proper state types here!
+                try ren.print("{f}: {f} = undefined,\n", .{
                     fmt_id(state_name),
-                    fmt_raw(state_type),
+                    fmt_raw(raw_state_type),
                 });
             }
 
