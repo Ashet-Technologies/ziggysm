@@ -1,13 +1,31 @@
 const std = @import("std");
 const args_parser = @import("args");
 
+pub const std_options: std.Options = .{
+    .log_level = .err,
+};
+
 const CliArgs = struct {
     help: bool = false,
-    output: []const u8 = "",
+    output: ?[]const u8 = null,
+    @"dump-ast": bool = false,
+    @"dump-ir": bool = false,
+    @"no-fmt": bool = false,
 
     pub const shorthands = .{
         .h = "help",
         .o = "output",
+    };
+
+    pub const meta = .{
+        .usage_summary = "[options] <input.zigsm>",
+        .option_docs = .{
+            .help = "Show this help text and exit.",
+            .output = "Write generated Zig code to a file instead of stdout.",
+            .@"dump-ast" = "Print AST debug output to stderr.",
+            .@"dump-ir" = "Print IR debug output to stderr.",
+            .@"no-fmt" = "Skip zig fmt post-processing.",
+        },
     };
 };
 
@@ -16,38 +34,72 @@ pub fn main() !u8 {
     defer arena.deinit();
 
     const allocator = arena.allocator();
-    const stdout = std.fs.File.stdout().deprecatedWriter();
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    const stdout = &stdout_writer.interface;
+    const stderr = &stderr_writer.interface;
+    defer stdout.flush() catch {};
+    defer stderr.flush() catch {};
 
     var cli = args_parser.parseForCurrentProcess(CliArgs, allocator, .print) catch return 1;
     defer cli.deinit();
 
+    const exe_name = cli.executable_name orelse "ziggysm";
+
+    if (cli.options.help) {
+        args_parser.printHelp(CliArgs, exe_name, stdout) catch return 1;
+        return 0;
+    }
+
     if (cli.positionals.len != 1) {
-        @panic("poop");
+        if (cli.positionals.len == 0) {
+            try stderr.writeAll("error: missing input\n\n");
+        } else {
+            try stderr.writeAll("error: expected a single input file\n\n");
+        }
+        args_parser.printHelp(CliArgs, exe_name, stderr) catch return 1;
+        return 1;
     }
 
     const file_name = cli.positionals[0];
 
-    const script = try std.fs.cwd().readFileAlloc(allocator, file_name, 1 << 20);
+    const script = std.fs.cwd().readFileAlloc(allocator, file_name, 1 << 20) catch |err| {
+        try stderr.print("error: unable to read '{s}': {s}\n", .{ file_name, @errorName(err) });
+        return 1;
+    };
     defer allocator.free(script);
 
-    var document = try parse(allocator, script);
+    var document = parse(allocator, script) catch |err| {
+        try stderr.print("error: failed to parse '{s}': {s}\n", .{ file_name, @errorName(err) });
+        return 1;
+    };
     defer document.deinit();
 
-    try ast.dump(document, stdout);
+    if (cli.options.@"dump-ast") {
+        try stderr.writeAll("AST:\n");
+        try ast.dump(document, stderr);
+        try stderr.writeByte('\n');
+    }
 
-    var program = try generate_code(allocator, document);
+    var program = generate_code(allocator, document) catch |err| {
+        try stderr.print("error: failed to compile '{s}': {s}\n", .{ file_name, @errorName(err) });
+        return 1;
+    };
     defer program.deinit();
-    {
-        const writer = stdout;
+    if (cli.options.@"dump-ir") {
+        try stderr.writeAll("IR:\n");
         for (program.structure) |node| {
             switch (node) {
                 .state_machine => |sm| {
-                    try writer.print("StateMachine {s}:\n", .{sm.name});
-                    try ir.dump(sm, writer);
+                    try stderr.print("StateMachine {s}:\n", .{sm.name});
+                    try ir.dump(sm, stderr);
                 },
-                .top_level_code => |code| try writer.print("TopLevel Code: {f}\n", .{code}),
+                .top_level_code => |code| try stderr.print("TopLevel Code: {f}\n", .{code}),
             }
         }
+        try stderr.writeByte('\n');
     }
 
     const unformatted_code = blk: {
@@ -64,7 +116,7 @@ pub fn main() !u8 {
         break :blk try sink.toOwnedSliceSentinel(allocator, 0);
     };
 
-    const formatted_code = blk: {
+    const formatted_code = if (cli.options.@"no-fmt") unformatted_code else blk: {
         const zig_ast = try std.zig.Ast.parse(allocator, unformatted_code, .zig);
         if (zig_ast.errors.len > 0)
             break :blk unformatted_code;
@@ -72,9 +124,9 @@ pub fn main() !u8 {
         break :blk try zig_ast.renderAlloc(allocator);
     };
 
-    if (cli.options.output.len > 0) {
+    if (cli.options.output) |output_path| {
         try std.fs.cwd().writeFile(.{
-            .sub_path = cli.options.output,
+            .sub_path = output_path,
             .data = formatted_code,
         });
     } else {
@@ -840,11 +892,11 @@ pub const ast = struct {
         }
     };
 
-    pub fn dump(doc: Document, writer: anytype) !void {
+    pub fn dump(doc: Document, writer: *std.Io.Writer) !void {
         const Dumper = struct {
             const Dumper = @This();
 
-            stream: @TypeOf(writer),
+            stream: *std.Io.Writer,
 
             fn render(dmp: Dumper, d: Document) !void {
                 for (d.top_level_nodes) |node| {
@@ -867,7 +919,7 @@ pub const ast = struct {
                 }
             }
 
-            fn block(dmp: Dumper, blk: Block, depth: usize) @TypeOf(writer).Error!void {
+            fn block(dmp: Dumper, blk: Block, depth: usize) std.Io.Writer.Error!void {
                 const prefix = ("\t" ** 32)[0..depth];
 
                 try dmp.stream.print("{s}{{\n", .{prefix});
@@ -1090,7 +1142,7 @@ const ir = struct {
         value: TextBlock,
     };
 
-    pub fn dump(pgm: StateMachine, writer: anytype) !void {
+    pub fn dump(pgm: StateMachine, writer: *std.Io.Writer) !void {
         for (pgm.instructions, 0..) |instr, offset| {
             for (pgm.labels.keys(), pgm.labels.values()) |lbl, data| {
                 if (data.offset != offset)
