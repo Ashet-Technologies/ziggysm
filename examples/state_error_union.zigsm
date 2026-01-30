@@ -1,0 +1,58 @@
+const std = @import("std");
+
+$suspender read() error{Timeout}!u8;
+
+$statemachine NoTryStoresErrorUnion() void {
+    $yield read() -> $state r;
+    $if(${r} == error.Timeout) {
+        $return;
+    }
+    $return;
+}
+
+$statemachine TryStoresPayload() void {
+    $yield $try read() -> $state b;
+    $return;
+}
+
+$statemachine AssignExistingState() void {
+    $state r: error{Timeout}!u8 = error.Timeout;
+    $yield read() -> ${r};
+    $if(${r} == error.Timeout) {
+        $return;
+    }
+    $return;
+}
+
+test "NoTry stores error union" {
+    const SM = NoTryStoresErrorUnion;
+    comptime {
+        try std.testing.expect(@TypeOf(@field(@as(SM.Data, undefined), "NoTryStoresErrorUnion:r")) == error{Timeout}!u8);
+    }
+
+    var sm: SM = .{};
+    try std.testing.expectEqual(SM.Result.read, try sm.step(.launch));
+    try std.testing.expectEqual(SM.Result.stop, try sm.step(.{ .read = error.Timeout }));
+}
+
+test "Try stores payload" {
+    const SM = TryStoresPayload;
+    comptime {
+        try std.testing.expect(@TypeOf(@field(@as(SM.Data, undefined), "TryStoresPayload:b")) == u8);
+    }
+
+    var sm: SM = .{};
+    try std.testing.expectEqual(SM.Result.read, try sm.step(.launch));
+    try std.testing.expectError(error.Timeout, sm.step(.{ .read = error.Timeout }));
+}
+
+test "Existing state assignment respects type" {
+    const SM = AssignExistingState;
+    comptime {
+        try std.testing.expect(@TypeOf(@field(@as(SM.Data, undefined), "AssignExistingState:r")) == error{Timeout}!u8);
+    }
+
+    var sm: SM = .{};
+    try std.testing.expectEqual(SM.Result.read, try sm.step(.launch));
+    try std.testing.expectEqual(SM.Result.stop, try sm.step(.{ .read = error.Timeout }));
+}
