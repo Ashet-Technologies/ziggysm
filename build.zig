@@ -3,6 +3,7 @@ const std = @import("std");
 const examples = [_][]const u8{
     "examples/basic.zigsm",
     "examples/calling.zigsm",
+    "examples/call_output.zigsm",
     "examples/submachine.zigsm",
     "examples/errors.zigsm",
     "examples/loop.zigsm",

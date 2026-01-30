@@ -1072,6 +1072,8 @@ const ir = struct {
     pub const Call = struct {
         target: Label,
         dest_variable: []const u8,
+        output_variable: ?[]const u8,
+        use_try: bool,
     };
 
     pub const Return = struct {
@@ -1119,6 +1121,12 @@ const ir = struct {
                 },
                 .call => |branch| {
                     try writer.print("CALL  {f}, {s}", .{ branch.target, branch.dest_variable });
+                    if (branch.use_try) {
+                        try writer.writeAll(" try");
+                    }
+                    if (branch.output_variable) |output| {
+                        try writer.print(" -> {s}", .{output});
+                    }
                 },
                 .ret => |branch| {
                     try writer.print("RET   {s}", .{branch.dest_variable});
@@ -1421,6 +1429,8 @@ const CodeGen = struct {
         UnknownSuspender,
         ParameterMismatch,
         UnknownStateMachine,
+        UnknownStateVariable,
+        InvalidCallOutput,
         DuplicateState,
     }!void {
         for (block.statements) |stmt| {
@@ -1436,6 +1446,27 @@ const CodeGen = struct {
             return error.DuplicateState;
         }
         gop.value_ptr.* = type_name;
+    }
+
+    fn parse_state_reference(text: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, text, Tokenizer.whitespace);
+        if (!std.mem.startsWith(u8, trimmed, "${") or trimmed.len < 3 or trimmed[trimmed.len - 1] != '}') {
+            return null;
+        }
+        const inner = trimmed[2 .. trimmed.len - 1];
+        return std.mem.trim(u8, inner, Tokenizer.whitespace);
+    }
+
+    fn is_void_type(type_name: ir.TextBlock) bool {
+        const trimmed = std.mem.trim(u8, type_name.text, Tokenizer.whitespace);
+        return std.mem.eql(u8, trimmed, "void");
+    }
+
+    fn error_union_payload(type_name: ir.TextBlock) ?ir.TextBlock {
+        const text = type_name.text;
+        const index = std.mem.indexOfScalar(u8, text, '!') orelse return null;
+        const payload_text = std.mem.trim(u8, text[index + 1 ..], Tokenizer.whitespace);
+        return .{ .text = payload_text, .scope = type_name.scope };
     }
 
     fn emit_error(cg: *CodeGen, comptime fmt: []const u8, args: anytype) !void {
@@ -1516,12 +1547,32 @@ const CodeGen = struct {
                     } });
                 }
 
+                const payload_type = error_union_payload(submachine.return_type);
+                const use_try = call.with_try and payload_type != null;
+                const is_void_return = is_void_type(submachine.return_type);
+                var output_variable: ?[]const u8 = null;
+
                 if (call.output_to) |output_to| {
+                    if (is_void_return) {
+                        try cg.emit_error("Cannot capture output from void procedure {s}", .{call.function_name});
+                        return error.InvalidCallOutput;
+                    }
                     if (call.as_state) {
-                        try cg.add_state_var(
-                            try cg.get_state_name(ctx.scope, .{ .local = output_to.text }),
-                            submachine.return_type,
-                        );
+                        const output_name = try cg.get_state_name(ctx.scope, .{ .local = output_to.text });
+                        const output_type = if (use_try) payload_type.? else submachine.return_type;
+                        try cg.add_state_var(output_name, output_type);
+                        output_variable = output_name;
+                    } else {
+                        const state_ref = parse_state_reference(output_to.text) orelse {
+                            try cg.emit_error("Invalid call output target {s}", .{output_to.text});
+                            return error.SyntaxError;
+                        };
+                        const output_name = try cg.get_state_name(ctx.scope, .{ .local = state_ref });
+                        if (!cg.state_variables.contains(output_name)) {
+                            try cg.emit_error("Unknown state variable {s}", .{state_ref});
+                            return error.UnknownStateVariable;
+                        }
+                        output_variable = output_name;
                     }
                 }
 
@@ -1531,6 +1582,8 @@ const CodeGen = struct {
                 try cg.emit(.{ .call = .{
                     .target = target.id,
                     .dest_variable = call.function_name,
+                    .output_variable = output_variable,
+                    .use_try = use_try,
                 } });
 
                 try cg.add_sm_dependency(call.function_name);
@@ -1856,8 +1909,12 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     @panic("used undeclared state");
                 };
 
-                const state_type: ir.TextBlock = if (std.mem.indexOfScalar(u8, raw_state_type.text, '!')) |index|
-                    .{ .text = raw_state_type.text[index + 1 ..], .scope = null }
+                const is_scoped_state = std.mem.indexOfScalar(u8, state_name, ':') != null;
+                const state_type: ir.TextBlock = if (is_scoped_state)
+                    if (std.mem.indexOfScalar(u8, raw_state_type.text, '!')) |index|
+                        .{ .text = raw_state_type.text[index + 1 ..], .scope = null }
+                    else
+                        raw_state_type
                 else
                     raw_state_type;
 
@@ -1957,6 +2014,20 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     try ren.write_state_switch(target_state);
 
                     try ren.write_new_state(hopstate, false);
+
+                    if (call.output_variable) |output_variable| {
+                        try ren.required_states.put(output_variable, {});
+                        try ren.print("      sm.data.{f} = ", .{fmt_id(output_variable)});
+                    } else if (call.use_try) {
+                        try ren.writeAll("      _ = ");
+                    }
+
+                    if (call.output_variable != null or call.use_try) {
+                        if (call.use_try) {
+                            try ren.writeAll("try ");
+                        }
+                        try ren.print("sm.data.{f};\n", .{fmt_id(call.dest_variable)});
+                    }
 
                     return .default;
                 },
