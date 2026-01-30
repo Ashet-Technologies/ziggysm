@@ -1,0 +1,30 @@
+const std = @import("std");
+
+$suspender write_byte(data: u8) void;
+
+$proc ReturnByte() u8 {
+    $return 42;
+}
+
+$statemachine CallOutputState() void {
+    $call ReturnByte() -> $state out;
+    $yield write_byte(${out});
+}
+
+$statemachine CallOutputExisting() void {
+    $state out: u8 = 0;
+    $call ReturnByte() -> ${out};
+    $yield write_byte(${out});
+}
+
+test CallOutputState {
+    var sm: CallOutputState = .{};
+    try std.testing.expectEqual(CallOutputState.Result{ .write_byte = .{42} }, try sm.step(.launch));
+    try std.testing.expectEqual(CallOutputState.Result.stop, try sm.step(.write_byte));
+}
+
+test CallOutputExisting {
+    var sm: CallOutputExisting = .{};
+    try std.testing.expectEqual(CallOutputExisting.Result{ .write_byte = .{42} }, try sm.step(.launch));
+    try std.testing.expectEqual(CallOutputExisting.Result.stop, try sm.step(.write_byte));
+}
