@@ -1,0 +1,34 @@
+const std = @import("std");
+
+const ProcError = error{Fail};
+
+$suspender read_byte() ProcError!u8;
+$suspender write_byte(data: u8) void;
+
+$proc TryProc() ProcError!u8 {
+    $yield read_byte() -> $state value;
+    $return ${value};
+}
+
+$statemachine CallTryNoOutput() void {
+    $call $try TryProc();
+    $yield write_byte(1);
+}
+
+$statemachine CallTryWithOutput() void {
+    $call $try TryProc() -> $state out;
+    $yield write_byte(${out});
+}
+
+test CallTryNoOutput {
+    var sm: CallTryNoOutput = .{};
+    try std.testing.expectEqual(CallTryNoOutput.Result.read_byte, try sm.step(.launch));
+    try std.testing.expectEqual(error.Fail, sm.step(.{ .read_byte = error.Fail }));
+}
+
+test CallTryWithOutput {
+    var sm: CallTryWithOutput = .{};
+    try std.testing.expectEqual(CallTryWithOutput.Result.read_byte, try sm.step(.launch));
+    try std.testing.expectEqual(CallTryWithOutput.Result{ .write_byte = .{7} }, try sm.step(.{ .read_byte = 7 }));
+    try std.testing.expectEqual(CallTryWithOutput.Result.stop, try sm.step(.write_byte));
+}

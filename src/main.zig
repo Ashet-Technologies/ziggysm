@@ -1072,6 +1072,8 @@ const ir = struct {
     pub const Call = struct {
         target: Label,
         dest_variable: []const u8,
+        output: ?TextBlock,
+        use_try: bool,
     };
 
     pub const Return = struct {
@@ -1118,7 +1120,12 @@ const ir = struct {
                     try writer.print("BR    {f}", .{branch.target});
                 },
                 .call => |branch| {
-                    try writer.print("CALL  {f}, {s}", .{ branch.target, branch.dest_variable });
+                    try writer.print("CALL  {f}, {s}{s}{?f}", .{
+                        branch.target,
+                        branch.dest_variable,
+                        if (branch.use_try) " try" else "",
+                        branch.output,
+                    });
                 },
                 .ret => |branch| {
                     try writer.print("RET   {s}", .{branch.dest_variable});
@@ -1422,6 +1429,7 @@ const CodeGen = struct {
         ParameterMismatch,
         UnknownStateMachine,
         DuplicateState,
+        OutputOnVoidReturn,
     }!void {
         for (block.statements) |stmt| {
             try cg.generate_stmt(stmt, ctx);
@@ -1478,6 +1486,11 @@ const CodeGen = struct {
         }
 
         return null;
+    }
+
+    fn is_void_type(type_name: ir.TextBlock) bool {
+        const trimmed = std.mem.trim(u8, type_name.text, " \t\n\r");
+        return std.mem.eql(u8, trimmed, "void");
     }
 
     fn emit_error(cg: *CodeGen, comptime fmt: []const u8, args: anytype) !void {
@@ -1562,11 +1575,23 @@ const CodeGen = struct {
                     } });
                 }
 
+                if (call.output_to != null and is_void_type(submachine.return_type)) {
+                    try cg.emit_error("Cannot assign output from void procedure {s}", .{call.function_name});
+                    return error.OutputOnVoidReturn;
+                }
+
+                const return_payload = error_union_payload(submachine.return_type);
+                const use_try = call.with_try and return_payload != null;
+
                 if (call.output_to) |output_to| {
                     if (call.as_state) {
+                        const state_type = if (use_try)
+                            return_payload.?
+                        else
+                            submachine.return_type;
                         try cg.add_state_var(
                             try cg.get_state_name(ctx.scope, .{ .local = output_to.text }),
-                            submachine.return_type,
+                            state_type,
                         );
                     }
                 }
@@ -1577,6 +1602,14 @@ const CodeGen = struct {
                 try cg.emit(.{ .call = .{
                     .target = target.id,
                     .dest_variable = call.function_name,
+                    .output = if (call.output_to) |output_to|
+                        if (call.as_state)
+                            ctx.local(.{ .text = try std.fmt.allocPrint(cg.allocator, "${{{s}}}", .{output_to.text}) })
+                        else
+                            ctx.local(output_to)
+                    else
+                        null,
+                    .use_try = use_try,
                 } });
 
                 try cg.add_sm_dependency(call.function_name);
@@ -1998,6 +2031,21 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     try ren.write_state_switch(target_state);
 
                     try ren.write_new_state(hopstate, false);
+
+                    if (call.use_try or call.output != null) {
+                        try ren.required_states.put(call.dest_variable, {});
+
+                        if (call.output) |output_target| {
+                            try ren.write_code(output_target);
+                        } else {
+                            try ren.writeAll("_");
+                        }
+                        try ren.writeAll(" = ");
+                        if (call.use_try) {
+                            try ren.writeAll("try ");
+                        }
+                        try ren.print("sm.data.{f};\n", .{fmt_id(call.dest_variable)});
+                    }
 
                     return .default;
                 },
