@@ -11,6 +11,43 @@ const examples = [_][]const u8{
     "examples/state_error_union.zigsm",
 };
 
+const recursion_tests = [_]struct {
+    name: []const u8,
+    path: []const u8,
+    expect_success: bool,
+    stderr_match: ?[]const u8 = null,
+}{
+    .{
+        .name = "direct",
+        .path = "tests/recursion_direct.zigsm",
+        .expect_success = false,
+        .stderr_match = "Recursion is forbidden: A -> A",
+    },
+    .{
+        .name = "indirect",
+        .path = "tests/recursion_indirect.zigsm",
+        .expect_success = false,
+        .stderr_match = "Recursion is forbidden: A -> B -> A",
+    },
+    .{
+        .name = "longer",
+        .path = "tests/recursion_longer.zigsm",
+        .expect_success = false,
+        .stderr_match = "Recursion is forbidden: A -> B -> C -> A",
+    },
+    .{
+        .name = "non_recursive",
+        .path = "tests/recursion_non_recursive.zigsm",
+        .expect_success = true,
+    },
+    .{
+        .name = "submachine",
+        .path = "tests/recursion_submachine.zigsm",
+        .expect_success = false,
+        .stderr_match = "Recursion is forbidden: Sub1 -> ProcA -> Sub1",
+    },
+};
+
 pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     const test_step = b.step("test", "Run unit tests");
@@ -67,5 +104,21 @@ pub fn build(b: *std.Build) void {
 
         const run_example_test = b.addRunArtifact(example_test);
         test_step.dependOn(&run_example_test.step);
+    }
+
+    for (recursion_tests) |recursion_test| {
+        const run_recursion = b.addRunArtifact(exe);
+        run_recursion.addArg("--output");
+        _ = run_recursion.addOutputFileArg(b.fmt("recursion_{s}.zig", .{recursion_test.name}));
+        run_recursion.addFileArg(b.path(recursion_test.path));
+
+        if (recursion_test.expect_success) {
+            run_recursion.expectExitCode(0);
+        } else {
+            run_recursion.expectExitCode(1);
+            run_recursion.addCheck(.{ .expect_stderr_match = b.dupe(recursion_test.stderr_match.?) });
+        }
+
+        test_step.dependOn(&run_recursion.step);
     }
 }

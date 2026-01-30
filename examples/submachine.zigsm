@@ -15,7 +15,8 @@ $submachine First() void {
             $return;
         }
         $if(${output} == 2) {
-            $call Second();
+            $yield write_byte(2);
+            $jump Second();
         }
 
         $yield write_byte(1);
@@ -30,7 +31,8 @@ $submachine Second() void {
             $return;
         }
         $if(${output} == 1) {
-            $call First();
+            $yield write_byte(1);
+            $jump First();
         }
 
         $yield write_byte(2);
@@ -51,12 +53,14 @@ test SubMachine {
         try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
         try std.testing.expectEqual(SM.Result{.write_byte=.{1}}, try sm.step(.{ .read_byte = 12 }));
         try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
-        try std.testing.expectEqual(SM.Result.read_byte, try sm.step(.{ .read_byte = 2 }));
+        try std.testing.expectEqual(SM.Result{.write_byte=.{2}}, try sm.step(.{ .read_byte = 2 }));
+        try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
         try std.testing.expectEqual(SM.Result{.write_byte=.{2}}, try sm.step(.{ .read_byte = 14 }));
         try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
         try std.testing.expectEqual(SM.Result{.write_byte=.{2}}, try sm.step(.{ .read_byte = 16 }));
         try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
-        try std.testing.expectEqual(SM.Result.read_byte, try sm.step(.{ .read_byte = 1 }));
+        try std.testing.expectEqual(SM.Result{.write_byte=.{1}}, try sm.step(.{ .read_byte = 1 }));
+        try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
         try std.testing.expectEqual(SM.Result{.write_byte=.{1}}, try sm.step(.{ .read_byte = 18 }));
         try std.testing.expectEqual(SM.Result.read_byte , try sm.step(.write_byte));
         try std.testing.expectEqual(SM.Result{.write_byte=.{1}}, try sm.step(.{ .read_byte = 20 }));

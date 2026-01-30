@@ -1,0 +1,11 @@
+$statemachine Main() void {
+    $call A();
+}
+
+$proc A() void {
+    $call B();
+}
+
+$proc B() void {
+    $return;
+}
