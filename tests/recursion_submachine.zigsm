@@ -1,0 +1,7 @@
+$submachine Sub1() void {
+    $call ProcA();
+}
+
+$proc ProcA() void {
+    $call Sub1();
+}

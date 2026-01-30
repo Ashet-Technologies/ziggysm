@@ -1184,6 +1184,8 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
         }
     }
 
+    try ensure_no_recursion(arena.allocator(), document, &submachines);
+
     for (document.top_level_nodes) |node| {
         const sm = switch (node) {
             .state_machine => |*sm| sm,
@@ -1246,6 +1248,135 @@ fn generate_code(allocator: std.mem.Allocator, document: ast.Document) !ir.Progr
         .structure = try structure.toOwnedSlice(arena.allocator()),
         .suspenders = suspenders,
     };
+}
+
+const Visit = enum { white, gray, black };
+
+fn ensure_no_recursion(
+    allocator: std.mem.Allocator,
+    document: ast.Document,
+    submachines: *const std.StringArrayHashMap(CodeGen.StateMachine),
+) !void {
+    var graph: std.StringArrayHashMap(std.ArrayList([]const u8)) = .init(allocator);
+    var node_order: std.ArrayList([]const u8) = .empty;
+
+    for (document.top_level_nodes) |node| {
+        const sm = switch (node) {
+            .sub_machine, .procedure => |sm| sm,
+            .state_machine, .raw_code, .suspender => continue,
+        };
+
+        var calls: std.ArrayList([]const u8) = .empty;
+        try collect_call_edges(allocator, sm.body, &calls, submachines);
+        try graph.put(sm.name, calls);
+        try node_order.append(allocator, sm.name);
+    }
+
+    try detect_recursion(allocator, &graph, node_order.items);
+}
+
+fn collect_call_edges(
+    allocator: std.mem.Allocator,
+    block: ast.Block,
+    calls: *std.ArrayList([]const u8),
+    submachines: *const std.StringArrayHashMap(CodeGen.StateMachine),
+) !void {
+    for (block.statements) |stmt| {
+        switch (stmt) {
+            .call => |call| {
+                if (submachines.get(call.function_name) == null) {
+                    std.log.err("Unknown procedure {s}", .{call.function_name});
+                    return error.UnknownStateMachine;
+                }
+                try calls.append(allocator, call.function_name);
+            },
+            .infinite_loop => |loop| try collect_call_edges(allocator, loop.body, calls, submachines),
+            .while_loop => |loop| try collect_call_edges(allocator, loop.body, calls, submachines),
+            .if_condition => |cond| try collect_call_edges(allocator, cond.true_body, calls, submachines),
+            else => {},
+        }
+    }
+}
+
+fn detect_recursion(
+    allocator: std.mem.Allocator,
+    graph: *const std.StringArrayHashMap(std.ArrayList([]const u8)),
+    node_order: []const []const u8,
+) !void {
+    var colors: std.StringArrayHashMap(Visit) = .init(allocator);
+    var stack: std.ArrayList([]const u8) = .empty;
+
+    for (node_order) |node| {
+        if (colors.contains(node))
+            continue;
+        try colors.put(node, .white);
+    }
+
+    for (node_order) |node| {
+        if (colors.get(node).? == .white) {
+            try visit_node(allocator, graph, &colors, &stack, node);
+        }
+    }
+}
+
+fn visit_node(
+    allocator: std.mem.Allocator,
+    graph: *const std.StringArrayHashMap(std.ArrayList([]const u8)),
+    colors: *std.StringArrayHashMap(Visit),
+    stack: *std.ArrayList([]const u8),
+    node: []const u8,
+) !void {
+    try colors.put(node, .gray);
+    try stack.append(allocator, node);
+
+    if (graph.get(node)) |neighbors| {
+        for (neighbors.items) |neighbor| {
+            const neighbor_state = colors.get(neighbor) orelse blk: {
+                try colors.put(neighbor, .white);
+                break :blk .white;
+            };
+            switch (neighbor_state) {
+                .gray => {
+                    try report_recursion_cycle(allocator, stack.items, neighbor);
+                    return error.RecursionDetected;
+                },
+                .white => try visit_node(allocator, graph, colors, stack, neighbor),
+                .black => {},
+            }
+        }
+    }
+
+    _ = stack.pop();
+    try colors.put(node, .black);
+}
+
+fn report_recursion_cycle(
+    allocator: std.mem.Allocator,
+    stack: []const []const u8,
+    target: []const u8,
+) !void {
+    var start_index: usize = 0;
+    for (stack, 0..) |name, idx| {
+        if (std.mem.eql(u8, name, target)) {
+            start_index = idx;
+            break;
+        }
+    }
+
+    var message: std.ArrayList(u8) = .empty;
+    defer message.deinit(allocator);
+
+    const writer = message.writer(allocator);
+    for (stack[start_index..], 0..) |name, idx| {
+        if (idx > 0) {
+            try writer.writeAll(" -> ");
+        }
+        try writer.writeAll(name);
+    }
+    try writer.writeAll(" -> ");
+    try writer.writeAll(target);
+
+    std.log.err("Recursion is forbidden: {s}", .{message.items});
 }
 
 const CodeGen = struct {
@@ -2020,9 +2151,9 @@ fn render(allocator: std.mem.Allocator, pgm: ir.Program, sm: ir.StateMachine, st
                     const hopstate = try ren.alloc_state(.branch);
 
                     try ren.required_dynbranch.put(call.dest_variable, {});
-                    try ren.print("      if(sm.branches.{f} != null) @panic(\"A recursive CALL to {f} was detected at runtime.\");\n", .{
+                    // Safety check: recursion should be rejected at compile-time, but keep an assert in debug builds.
+                    try ren.print("      // recursion should be rejected at compile-time\n      std.debug.assert(sm.branches.{f} == null);\n", .{
                         fmt_id(call.dest_variable),
-                        std.zig.fmtString(call.dest_variable),
                     });
 
                     try ren.print("      sm.branches.{f} = .{f};\n", .{ fmt_id(call.dest_variable), hopstate });

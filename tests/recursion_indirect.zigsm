@@ -1,0 +1,7 @@
+$proc A() void {
+    $call B();
+}
+
+$proc B() void {
+    $call A();
+}
